@@ -4,6 +4,9 @@
   "private": true,
   "keywords": ["pi-package"],
   "type": "module",
+  "scripts": {
+    "test:e2e": "bash tests/picker-exit.sh"
+  },
   "bin": {
     "subagent": "./subagent.ts"
   },

@@ -19,6 +19,26 @@ By default, the child inherits the current Pi provider, model, and reasoning lev
 
 `--cwd` defaults to the current directory. Repeat `--prompt` and `--file` as needed; Pi receives all of them in the first user turn. Run `subagent spawn` directly without piping or redirecting its concise output.
 
+When the user keeps choosing the same model, they want it in the config file, not on every command:
+
+```sh
+subagent spawn --preset review --prompt "Review the current diff"
+```
+
+## Configure
+
+The CLI and every child read `$PI_CODING_AGENT_DIR/subagents.json`, then `<cwd>/.pi/subagents.json`, which overrides it:
+
+```json
+{
+  "defaults": { "model": "mify/deepseek/deepseek-flash", "thinking": "low" },
+  "presets": { "review": { "provider": "openai-codex", "model": "gpt-5.4-high", "thinking": "high" } },
+  "exitKey": "ctrl+q"
+}
+```
+
+Per field, a spawn flag wins over `--preset`, which wins over `defaults`, which wins over the inherited `PI_*` variables. `exitKey` is the key that leaves an attached child and returns to the parent session. Never write this file to change one run; flags are per-run, the file is a standing choice.
+
 ## Tools
 
 Without `--tools`, Pi enables its four default tools:
@@ -82,6 +102,10 @@ subagent send <handle> --follow-up "message"
 ```
 
 Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not use `tmux send-keys`.
+
+## Attach
+
+Use `/subagent`, or press `←` on an empty parent prompt, to pick a child. The exit key from the config (`ctrl+q` by default) returns to the parent session, whether the child is idle or working.
 
 ## Interrupt
 

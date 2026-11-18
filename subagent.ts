@@ -7,18 +7,25 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	assistantText,
+	CHOICE_FIELDS,
+	configSources,
 	effectiveRunState,
 	getRunsDir,
 	inboxDir,
 	launchRun,
 	listRuns,
+	mergeConfigs,
 	queueInboxMessage,
 	readLatestAssistant,
 	readMetadata,
 	removeRunDir,
 	runDisplayName,
 	isValidRunName,
+	type ChoiceField,
+	type ConfigSource,
+	type ModelChoice,
 	type RunMetadata,
+	type SubagentConfig,
 	tmuxSessionExists,
 	updateMetadata,
 	waitForRunShutdown,
@@ -27,6 +34,12 @@ import {
 
 const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const BUILTIN_EXTENSION_PREFIX = "builtin:";
+const DEFAULT_THINKING = "medium";
+const ENV_VARS: Record<ChoiceField, string> = {
+	provider: "PI_PROVIDER",
+	model: "PI_MODEL",
+	thinking: "PI_REASONING_LEVEL",
+};
 const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "index.ts");
 
 function fail(message: string): never {
@@ -35,16 +48,20 @@ function fail(message: string): never {
 
 function usage(): never {
 	fail(`Usage:
-  subagent spawn [--name <name>] [--provider <provider>] [--model <model>] [--thinking <level>]
-    [--cwd <dir>] [--tools <names>] [--no-extensions] [--extension <path|builtin:name>]... [--no-skills]
-    [--no-prompt-templates] [--no-context-files] (--prompt <text> | --file <path>)...
+  subagent spawn [--name <name>] [--preset <name>] [--provider <provider>] [--model <model>]
+    [--thinking <level>] [--cwd <dir>] [--tools <names>] [--no-extensions]
+    [--extension <path|builtin:name>]... [--no-skills] [--no-prompt-templates] [--no-context-files]
+    (--prompt <text> | --file <path>)...
   subagent status <handle>
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
   subagent interrupt <handle>
   subagent wait <handle> [--timeout <seconds>]
   subagent stop <handle>
-  subagent list`);
+  subagent list
+
+Config: $PI_CODING_AGENT_DIR/subagents.json (~/.pi/agent), then <cwd>/.pi/subagents.json;
+  the project file wins. Fields: defaults {provider, model, thinking}, presets.<name>, exitKey.`);
 }
 
 function valueAfter(args: string[], index: number, option: string): string {
@@ -89,12 +106,77 @@ function generateHandle(): string {
 	fail("Could not allocate a unique subagent handle");
 }
 
+function resolvePreset(
+	config: SubagentConfig,
+	name: string | undefined,
+): { name: string; choice: ModelChoice } | undefined {
+	if (name === undefined) {
+		return undefined;
+	}
+	const choice = config.presets?.[name];
+	if (choice) {
+		return { name, choice };
+	}
+	const available = Object.keys(config.presets ?? {}).sort();
+	const hint = available.length > 0 ? ` Available: ${available.join(", ")}` : " No presets defined";
+	fail(`Unknown preset: ${name}.${hint}`);
+}
+
+interface ResolvedChoice {
+	value?: string;
+	/** Where the value came from; reported when the value turns out to be invalid. */
+	from?: string;
+}
+
+function defaultsOrigin(sources: ConfigSource[], field: ChoiceField): string {
+	// The last source defining the field is the one that survives the merge.
+	for (let index = sources.length - 1; index >= 0; index--) {
+		if (sources[index].config.defaults?.[field] !== undefined) {
+			return sources[index].path;
+		}
+	}
+	return "config defaults";
+}
+
+/** Per field precedence: flag > preset > config defaults > env > builtin fallback. */
+function resolveChoice(
+	flags: ModelChoice,
+	preset: { name: string; choice: ModelChoice } | undefined,
+	config: SubagentConfig,
+	sources: ConfigSource[],
+): Record<ChoiceField, ResolvedChoice> {
+	const resolved = {} as Record<ChoiceField, ResolvedChoice>;
+	for (const field of CHOICE_FIELDS) {
+		const flagValue = flags[field];
+		if (flagValue) {
+			resolved[field] = { value: flagValue, from: `--${field}` };
+			continue;
+		}
+
+		const presetValue = preset?.choice[field];
+		if (presetValue) {
+			resolved[field] = { value: presetValue, from: `preset "${preset?.name}"` };
+			continue;
+		}
+
+		const configValue = config.defaults?.[field];
+		if (configValue) {
+			resolved[field] = { value: configValue, from: defaultsOrigin(sources, field) };
+			continue;
+		}
+
+		const envName = ENV_VARS[field];
+		const envValue = process.env[envName];
+		resolved[field] = envValue ? { value: envValue, from: `$${envName}` } : {};
+	}
+	return resolved;
+}
+
 function spawnSubagent(args: string[]): void {
 	if (process.env.PI_SUBAGENT_RUN_DIR) fail("Nested subagents are disabled");
 	let name: string | undefined;
-	let provider = process.env.PI_PROVIDER;
-	let model = process.env.PI_MODEL;
-	let thinking = process.env.PI_REASONING_LEVEL || "medium";
+	let presetName: string | undefined;
+	const flags: ModelChoice = {};
 	let cwd = process.cwd();
 	let tools: string | undefined;
 	let noExtensions = false;
@@ -112,16 +194,20 @@ function spawnSubagent(args: string[]): void {
 				name = normalizeRunName(valueAfter(args, i, arg));
 				i++;
 				break;
+			case "--preset":
+				presetName = valueAfter(args, i, arg);
+				i++;
+				break;
 			case "--provider":
-				provider = valueAfter(args, i, arg);
+				flags.provider = valueAfter(args, i, arg);
 				i++;
 				break;
 			case "--model":
-				model = valueAfter(args, i, arg);
+				flags.model = valueAfter(args, i, arg);
 				i++;
 				break;
 			case "--thinking":
-				thinking = valueAfter(args, i, arg);
+				flags.thinking = valueAfter(args, i, arg);
 				i++;
 				break;
 			case "--cwd":
@@ -164,9 +250,19 @@ function spawnSubagent(args: string[]): void {
 		}
 	}
 
-	if (!provider) fail("No provider specified and PI_PROVIDER is not set");
-	if (!model) fail("No model specified and PI_MODEL is not set");
-	if (!VALID_THINKING_LEVELS.has(thinking)) fail(`Invalid thinking level: ${thinking}`);
+	const sources = configSources(cwd);
+	const config = mergeConfigs(sources);
+	const preset = resolvePreset(config, presetName);
+	const resolved = resolveChoice(flags, preset, config, sources);
+	const provider = resolved.provider.value;
+	const model = resolved.model.value;
+	const thinking = resolved.thinking.value ?? DEFAULT_THINKING;
+
+	if (!provider) fail("No provider specified: pass --provider, a preset, config defaults, or PI_PROVIDER");
+	if (!model) fail("No model specified: pass --model, a preset, config defaults, or PI_MODEL");
+	if (!VALID_THINKING_LEVELS.has(thinking)) {
+		fail(`Invalid thinking level: ${thinking} (from ${resolved.thinking.from ?? "builtin default"})`);
+	}
 	if (tools !== undefined && !tools.split(",").some((name) => name.trim()))
 		fail("--tools requires at least one tool name");
 	if (prompts.length === 0 && files.length === 0) fail("spawn requires at least one --prompt or --file");

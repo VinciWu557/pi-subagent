@@ -34,6 +34,8 @@ export interface RunMetadata {
 	launchArgs?: string[];
 	/** Set by the parent when it stops the child on quit or session switch; the child is relaunched on resume. */
 	suspended?: boolean;
+	/** tmux argv the child's exit key runs; detach when the parent attached rather than switched. */
+	exitArgv?: string[];
 	state: RunState;
 	hasStarted: boolean;
 	createdAt: string;
@@ -70,6 +72,120 @@ export function getAgentDir(): string {
 
 export function getRunsDir(): string {
 	return join(getAgentDir(), "subagents");
+}
+
+export interface ModelChoice {
+	provider?: string;
+	model?: string;
+	thinking?: string;
+}
+
+export interface SubagentConfig {
+	defaults?: ModelChoice;
+	presets?: Record<string, ModelChoice>;
+	exitKey?: string;
+}
+
+export interface ConfigSource {
+	path: string;
+	config: SubagentConfig;
+}
+
+export const DEFAULT_EXIT_KEY = "ctrl+q";
+
+export const CHOICE_FIELDS = ["provider", "model", "thinking"] as const;
+
+export type ChoiceField = (typeof CHOICE_FIELDS)[number];
+
+const CONFIG_FILE_NAME = "subagents.json";
+
+function modelChoice(value: unknown): ModelChoice {
+	if (typeof value !== "object" || value === null) {
+		return {};
+	}
+	const record = value as Record<string, unknown>;
+	const choice: ModelChoice = {};
+	for (const field of CHOICE_FIELDS) {
+		const fieldValue = record[field];
+		if (typeof fieldValue === "string" && fieldValue.length > 0) {
+			choice[field] = fieldValue;
+		}
+	}
+	return choice;
+}
+
+/** Keep only known fields, so a stray key in the JSON cannot leak into a launch. */
+function sanitizeConfig(value: unknown): SubagentConfig {
+	if (typeof value !== "object" || value === null) {
+		return {};
+	}
+	const record = value as Record<string, unknown>;
+	const config: SubagentConfig = {};
+	if (typeof record.exitKey === "string" && record.exitKey.trim().length > 0) {
+		config.exitKey = record.exitKey;
+	}
+	if (record.defaults !== undefined) {
+		config.defaults = modelChoice(record.defaults);
+	}
+	if (typeof record.presets === "object" && record.presets !== null) {
+		const presets: Record<string, ModelChoice> = {};
+		for (const [name, choice] of Object.entries(record.presets)) {
+			presets[name] = modelChoice(choice);
+		}
+		config.presets = presets;
+	}
+	return config;
+}
+
+/** A broken or unreadable file only warns; spawn must never fail because of config. */
+function readConfig(path: string): SubagentConfig {
+	let raw: string;
+	try {
+		raw = readFileSync(path, "utf8");
+	} catch (error) {
+		// A missing file is normal; any other read error should still be visible.
+		if ((error as { code?: string }).code !== "ENOENT") {
+			process.stderr.write(`Warning: cannot read ${path}: ${String(error)}\n`);
+		}
+		return {};
+	}
+	try {
+		return sanitizeConfig(JSON.parse(raw));
+	} catch (error) {
+		process.stderr.write(`Warning: ignoring ${path}: ${String(error)}\n`);
+		return {};
+	}
+}
+
+/** User config first, project config second; the later source wins on merge. */
+export function configSources(cwd: string): ConfigSource[] {
+	const userPath = join(getAgentDir(), CONFIG_FILE_NAME);
+	const projectPath = join(cwd, ".pi", CONFIG_FILE_NAME);
+	return [
+		{ path: userPath, config: readConfig(userPath) },
+		{ path: projectPath, config: readConfig(projectPath) },
+	];
+}
+
+export function mergeConfigs(sources: ConfigSource[]): SubagentConfig {
+	const merged: SubagentConfig = {};
+	for (const { config } of sources) {
+		// exitKey replaces wholesale, defaults merge per field, presets merge per name.
+		if (config.exitKey !== undefined) {
+			merged.exitKey = config.exitKey;
+		}
+		if (config.defaults !== undefined) {
+			merged.defaults = { ...merged.defaults, ...config.defaults };
+		}
+		if (config.presets !== undefined) {
+			merged.presets = { ...merged.presets, ...config.presets };
+		}
+	}
+	return merged;
+}
+
+export function loadConfig(cwd: string): SubagentConfig {
+	return mergeConfigs(configSources(cwd));
 }
 
 export function metadataPath(runDir: string): string {
@@ -192,6 +308,7 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 			"--",
 			"env",
 			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
+			`PI_SUBAGENT_EXIT_KEY=${loadConfig(metadata.cwd).exitKey ?? DEFAULT_EXIT_KEY}`,
 			launcher,
 			"--session",
 			metadata.sessionFile,
