@@ -93,7 +93,7 @@ One JSON file, read by both the CLI and every child it spawns:
 }
 ```
 
-`subagent spawn --preset review` picks a named choice. Per field, a spawn flag wins over `--preset`, which wins over `defaults`, which wins over `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`; thinking falls back to `medium`. Errors name the file they came from, and a broken file only warns, so spawn keeps working.
+`subagent spawn --preset review` picks a named choice. Per field, `--preset` wins over a spawn flag, which wins over `defaults`, which wins over `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`; thinking falls back to `medium`. Errors name the file they came from, and a broken file only warns, so spawn keeps working.
 
 ## Isolation
 

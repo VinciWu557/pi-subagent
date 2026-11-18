@@ -138,7 +138,13 @@ function defaultsOrigin(sources: ConfigSource[], field: ChoiceField): string {
 	return "config defaults";
 }
 
-/** Per field precedence: flag > preset > config defaults > env > builtin fallback. */
+/**
+ * Per field precedence: preset > flag > config defaults > env > builtin fallback.
+ *
+ * A preset outranks the flags so a model that spawns children cannot talk itself into a
+ * pricier choice than the user configured: `--preset scout --model expensive` still runs
+ * scout's model. Flags only fill fields the preset leaves empty.
+ */
 function resolveChoice(
 	flags: ModelChoice,
 	preset: { name: string; choice: ModelChoice } | undefined,
@@ -147,15 +153,15 @@ function resolveChoice(
 ): Record<ChoiceField, ResolvedChoice> {
 	const resolved = {} as Record<ChoiceField, ResolvedChoice>;
 	for (const field of CHOICE_FIELDS) {
-		const flagValue = flags[field];
-		if (flagValue) {
-			resolved[field] = { value: flagValue, from: `--${field}` };
-			continue;
-		}
-
 		const presetValue = preset?.choice[field];
 		if (presetValue) {
 			resolved[field] = { value: presetValue, from: `preset "${preset?.name}"` };
+			continue;
+		}
+
+		const flagValue = flags[field];
+		if (flagValue) {
+			resolved[field] = { value: flagValue, from: `--${field}` };
 			continue;
 		}
 
