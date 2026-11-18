@@ -63,6 +63,7 @@ subagent status a1b2c3
 subagent rename a1b2c3 "error handling review"
 subagent send a1b2c3 "Focus on error handling"
 subagent send a1b2c3 --follow-up "Then summarize"
+subagent interrupt a1b2c3
 subagent wait a1b2c3
 subagent stop a1b2c3
 subagent list
@@ -70,12 +71,15 @@ subagent list
 
 Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
 
+Pressing Esc aborts the parent turn and interrupts every child that is mid-work. Interrupted children keep their process and transcript; they return to idle and accept the next `subagent send`.
+
 ## Isolation
 
 Optional spawn flags:
 
 - `--tools <names>`: comma-separated tool allowlist
 - `--no-extensions`: disable extension discovery while retaining the control bridge
+- `--extension <path|builtin:name>`: load one more extension in the child; repeatable. Paths must exist, built-ins take the `builtin:` prefix (e.g. `builtin:codemode`)
 - `--no-skills`: disable skills
 - `--no-prompt-templates`: disable prompt templates
 - `--no-context-files`: ignore repository instruction files

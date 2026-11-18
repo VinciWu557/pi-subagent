@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
 	accessSync,
 	constants,
@@ -40,10 +41,9 @@ export interface RunMetadata {
 	error?: string;
 }
 
-export interface InboxMessage {
-	message: string;
-	delivery: "auto" | "followUp";
-}
+export type InboxMessage =
+	| { kind: "message"; message: string; delivery: "auto" | "followUp" }
+	| { kind: "interrupt" };
 
 interface SessionEntry {
 	type: string;
@@ -78,6 +78,16 @@ export function metadataPath(runDir: string): string {
 
 export function inboxDir(runDir: string): string {
 	return join(runDir, "inbox");
+}
+
+export function queueInboxMessage(runDir: string, payload: InboxMessage): void {
+	const queueDir = inboxDir(runDir);
+	mkdirSync(queueDir, { recursive: true, mode: 0o700 });
+	// The timestamp prefix keeps delivery ordered; the suffix prevents collisions within one millisecond.
+	const target = join(queueDir, `${Date.now()}-${randomBytes(4).toString("hex")}.json`);
+	const temporary = `${target}.tmp`;
+	writeFileSync(temporary, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
+	renameSync(temporary, target);
 }
 
 export function isValidRunName(value: unknown): value is string {

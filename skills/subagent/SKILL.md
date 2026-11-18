@@ -49,6 +49,7 @@ Three additional built-in tools are available but off by default:
 ## Isolation flags
 
 - `--no-extensions` - Disable normal extension discovery. Use for an independent run that should not inherit unrelated extension behavior or extension-provided tools. The subagent control bridge is still explicitly loaded.
+- `--extension <path|builtin:name>` - Load one more extension in the child; repeatable. Use a path for a local extension file, or a built-in name such as `builtin:codemode`. The bridge stays loaded either way.
 - `--no-skills` - Hide installed skills from the child. Use for tightly specified tasks that should rely only on the supplied prompt and files.
 - `--no-prompt-templates` - Disable prompt-template commands. Usually unnecessary, but useful when testing a minimal child environment.
 - `--no-context-files` - Ignore repository instruction files such as `AGENTS.md` and `CLAUDE.md`. Use only when those instructions would bias an independent investigation. Do not use for implementation unless intentionally bypassing repository guidance.
@@ -81,6 +82,14 @@ subagent send <handle> --follow-up "message"
 ```
 
 Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not use `tmux send-keys`.
+
+## Interrupt
+
+```sh
+subagent interrupt <handle>
+```
+
+Aborts the child's current turn and leaves the process, transcript, and metadata intact; the child returns to idle. The parent does this on its own for every busy child when the user presses Esc, so interrupt a child directly only when the user asks for one subagent to stop while the rest keep working.
 
 ## Stop
 

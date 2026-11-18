@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,12 +12,12 @@ import {
 	inboxDir,
 	launchRun,
 	listRuns,
+	queueInboxMessage,
 	readLatestAssistant,
 	readMetadata,
 	removeRunDir,
 	runDisplayName,
 	isValidRunName,
-	type InboxMessage,
 	type RunMetadata,
 	tmuxSessionExists,
 	updateMetadata,
@@ -26,6 +26,7 @@ import {
 } from "./shared.ts";
 
 const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const BUILTIN_EXTENSION_PREFIX = "builtin:";
 const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "index.ts");
 
 function fail(message: string): never {
@@ -35,11 +36,12 @@ function fail(message: string): never {
 function usage(): never {
 	fail(`Usage:
   subagent spawn [--name <name>] [--provider <provider>] [--model <model>] [--thinking <level>]
-    [--cwd <dir>] [--tools <names>] [--no-extensions] [--no-skills]
+    [--cwd <dir>] [--tools <names>] [--no-extensions] [--extension <path|builtin:name>]... [--no-skills]
     [--no-prompt-templates] [--no-context-files] (--prompt <text> | --file <path>)...
   subagent status <handle>
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
+  subagent interrupt <handle>
   subagent wait <handle> [--timeout <seconds>]
   subagent stop <handle>
   subagent list`);
@@ -55,6 +57,16 @@ function normalizeRunName(value: string): string {
 	const name = value.trim();
 	if (!isValidRunName(name)) fail("Subagent name must be a single line of 1 to 64 characters");
 	return name;
+}
+
+function normalizeExtension(value: string): string {
+	if (value.startsWith(BUILTIN_EXTENSION_PREFIX)) {
+		if (value.length === BUILTIN_EXTENSION_PREFIX.length) fail("builtin: requires an extension name");
+		return value;
+	}
+	const path = resolve(value);
+	if (!existsSync(path)) fail(`Extension not found: ${value}`);
+	return path;
 }
 
 function runDirForHandle(handle: string): string {
@@ -91,6 +103,7 @@ function spawnSubagent(args: string[]): void {
 	let noContextFiles = false;
 	const prompts: string[] = [];
 	const files: string[] = [];
+	const extensions: string[] = [];
 
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
@@ -121,6 +134,10 @@ function spawnSubagent(args: string[]): void {
 				break;
 			case "--no-extensions":
 				noExtensions = true;
+				break;
+			case "--extension":
+				extensions.push(normalizeExtension(valueAfter(args, i, arg)));
+				i++;
 				break;
 			case "--no-skills":
 				noSkills = true;
@@ -165,6 +182,7 @@ function spawnSubagent(args: string[]): void {
 	const launchArgs: string[] = [];
 	if (tools) launchArgs.push("--tools", tools);
 	if (noExtensions) launchArgs.push("--no-extensions", "--extension", extensionPath);
+	for (const extension of extensions) launchArgs.push("--extension", extension);
 	if (noSkills) launchArgs.push("--no-skills");
 	if (noPromptTemplates) launchArgs.push("--no-prompt-templates");
 	if (noContextFiles) launchArgs.push("--no-context-files");
@@ -235,18 +253,19 @@ function sendSubagent(args: string[]): void {
 	const metadata = getRun(handle);
 	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${handle} is not running`);
 
-	const queueDir = inboxDir(metadata.runDir);
-	mkdirSync(queueDir, { recursive: true, mode: 0o700 });
-	const id = `${Date.now()}-${randomBytes(4).toString("hex")}`;
-	const target = join(queueDir, `${id}.json`);
-	const temporary = `${target}.tmp`;
-	const payload: InboxMessage = { message, delivery: followUp ? "followUp" : "auto" };
-	writeFileSync(temporary, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
-	renameSync(temporary, target);
+	queueInboxMessage(metadata.runDir, { kind: "message", message, delivery: followUp ? "followUp" : "auto" });
 
 	const state = effectiveRunState(metadata);
 	const verb = followUp && state === "busy" ? "Queued follow-up for" : state === "idle" ? "Prompted" : "Steered";
 	process.stdout.write(`${verb} ${runDisplayName(metadata)}\n`);
+}
+
+function interruptSubagent(args: string[]): void {
+	if (args.length !== 1) usage();
+	const metadata = getRun(args[0]);
+	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${metadata.handle} is not running`);
+	queueInboxMessage(metadata.runDir, { kind: "interrupt" });
+	process.stdout.write(`Interrupted ${runDisplayName(metadata)}\n`);
 }
 
 function parseTimeout(args: string[]): number {
@@ -322,6 +341,9 @@ async function main(): Promise<void> {
 			break;
 		case "send":
 			sendSubagent(args);
+			break;
+		case "interrupt":
+			interruptSubagent(args);
 			break;
 		case "wait":
 			await waitSubagent(args);

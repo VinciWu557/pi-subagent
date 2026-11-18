@@ -9,6 +9,7 @@ import {
 	inboxDir,
 	launchRun,
 	listRuns,
+	queueInboxMessage,
 	readMetadata,
 	removeRunDir,
 	runDisplayName,
@@ -24,6 +25,9 @@ const packageDir = dirname(fileURLToPath(import.meta.url));
 function isInboxMessage(value: unknown): value is InboxMessage {
 	if (typeof value !== "object" || value === null) return false;
 	const message = value as Record<string, unknown>;
+	if (message.kind === "interrupt") return true;
+	// A CLI from before the interrupt protocol omits kind, and its files are still plain messages.
+	if (message.kind !== undefined && message.kind !== "message") return false;
 	return typeof message.message === "string" && (message.delivery === "auto" || message.delivery === "followUp");
 }
 
@@ -171,6 +175,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			widgetTimer.unref();
 		});
 
+		pi.on("agent_settled", (event, ctx) => {
+			// Escape aborts the parent run; every child that is still working stops its own turn likewise.
+			if (!event.aborted) return;
+			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
+				const state = effectiveRunState(run);
+				if (state !== "busy" && state !== "starting") continue;
+				queueInboxMessage(run.runDir, { kind: "interrupt" });
+			}
+		});
+
 		pi.on("session_shutdown", async (event, ctx) => {
 			if (widgetTimer) clearInterval(widgetTimer);
 			widgetTimer = undefined;
@@ -228,6 +242,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						state: "error",
 						error: error instanceof Error ? error.message : String(error),
 					});
+					continue;
+				}
+
+				if (payload.kind === "interrupt") {
+					unlinkSync(path);
+					// State returns to idle through agent_settled once the aborted turn unwinds.
+					if (!currentContext.isIdle()) currentContext.abort();
 					continue;
 				}
 
