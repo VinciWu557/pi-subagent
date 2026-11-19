@@ -35,6 +35,8 @@ git clone git@github.com:VinciWu557/pi-subagent.git ~/.pi/agent/extensions/subag
 ln -s ../extensions/subagent/subagent.ts ~/.pi/agent/bin/subagent
 ```
 
+The clone path runs the TypeScript source directly. That only works outside `node_modules`: Node refuses to strip types from installed packages, so a published release ships a bundled `subagent.js` instead, built by `prepack`.
+
 ## Usage
 
 Spawn with a descriptive name using the parent session's provider, model, and thinking level:

@@ -1,6 +1,6 @@
 {
   "name": "@vinciwu557/pi-subagent",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation",
   "keywords": [
     "pi-package"
@@ -18,13 +18,16 @@
     "index.ts",
     "shared.ts",
     "subagent.ts",
+    "subagent.js",
     "skills"
   ],
   "scripts": {
+    "build": "bun build subagent.ts --target node --outfile subagent.js",
+    "prepack": "npm run build",
     "test:e2e": "bash tests/picker-exit.sh"
   },
   "bin": {
-    "subagent": "./subagent.ts"
+    "subagent": "subagent.js"
   },
   "pi": {
     "extensions": [
