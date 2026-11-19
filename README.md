@@ -2,6 +2,8 @@
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
+A fork of [badlogic/pi-subagent](https://github.com/badlogic/pi-subagent), adding presets, an interactive picker, a config file, and Esc-to-interrupt.
+
 Each subagent runs in its own tmux session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
 
 ## Requirements
@@ -12,14 +14,26 @@ Each subagent runs in its own tmux session with a dedicated Pi JSONL session. Th
 
 ## Install
 
-Clone into Pi's global extension directory and expose the CLI on `PATH`:
+Install as a Pi package from npm:
 
 ```sh
-git clone git@github.com:earendil-works/pi-subagent.git ~/.pi/agent/extensions/subagent
-ln -s ../extensions/subagent/subagent.ts ~/.pi/agent/bin/subagent
+pi install npm:@vinciwu557/pi-subagent
 ```
 
-Run `/reload` in an existing Pi session. The extension contributes its bundled skill automatically.
+Run `/reload` in an existing Pi session. The extension registers its bundled skill automatically.
+
+The package also ships the `subagent` CLI. Pi links it at `~/.pi/agent/npm/node_modules/.bin/subagent`, and `~/.pi/agent/bin` is usually already on `PATH`, so expose it there:
+
+```sh
+ln -sf ~/.pi/agent/npm/node_modules/.bin/subagent ~/.pi/agent/bin/subagent
+```
+
+To track the repository instead of a published release, clone into Pi's global extension directory and expose the CLI on `PATH`:
+
+```sh
+git clone git@github.com:VinciWu557/pi-subagent.git ~/.pi/agent/extensions/subagent
+ln -s ../extensions/subagent/subagent.ts ~/.pi/agent/bin/subagent
+```
 
 ## Usage
 
@@ -87,7 +101,7 @@ One JSON file, read by both the CLI and every child it spawns:
   "defaults": { "provider": "magpie", "model": "mify/deepseek/deepseek-flash", "thinking": "low" },
   "presets": {
     "review": { "provider": "openai-codex", "model": "gpt-5.4-high", "thinking": "high" },
-    "cheap": { "model": "mify/deepseek/deepseek-flash", "thinking": "off" }
+    "cheap": { "model": "deepseek/deepseek-flash", "thinking": "off" }
   },
   "exitKey": "ctrl+q"
 }
@@ -117,3 +131,7 @@ npm run test:e2e
 ```
 
 When `tmux`, `pi`, or `node` is missing, the run exits 0 after printing `SKIP`.
+
+## Acknowledgements
+
+This project is forked from [badlogic/pi-subagent](https://github.com/badlogic/pi-subagent), which provides the original design: tmux-backed child sessions, the control bridge, and the CLI surface. Upstream is the reference for core behavior; this fork extends it.

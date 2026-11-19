@@ -1,9 +1,25 @@
 {
-  "name": "@earendil-works/pi-subagent",
-  "version": "0.1.0",
-  "private": true,
-  "keywords": ["pi-package"],
+  "name": "@vinciwu557/pi-subagent",
+  "version": "0.1.1",
+  "description": "Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VinciWu557/pi-subagent.git"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
   "type": "module",
+  "files": [
+    "index.ts",
+    "shared.ts",
+    "subagent.ts",
+    "skills"
+  ],
   "scripts": {
     "test:e2e": "bash tests/picker-exit.sh"
   },
@@ -11,7 +27,12 @@
     "subagent": "./subagent.ts"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
