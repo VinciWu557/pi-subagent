@@ -12,6 +12,8 @@ Each subagent runs in its own tmux session with a dedicated Pi JSONL session. Th
 - Node.js 22.19 or newer
 - tmux
 
+macOS and Linux for now: tmux has no native Windows build. See the [roadmap](#windows) for the backend work that Windows support needs.
+
 ## Install
 
 Install as a Pi package from npm:
@@ -153,6 +155,30 @@ The lifecycle test covers the turn boundary. Without a model it kills a lock hol
 ```sh
 PI_E2E_MODEL=1 npm run test:lifecycle
 ```
+
+## Roadmap
+
+### Windows
+
+Children currently run in tmux, so the extension does not work on Windows. The plan is a pluggable terminal backend rather than a second code path bolted onto the tmux one.
+
+What constrains the design:
+
+- tmux has no native Windows build and never had one. Its only Windows story is Cygwin/MSYS2 POSIX emulation, where native binaries such as `node.exe` get unreliable key and IME handling.
+- psmux is a third-party Rust and ConPTY reimplementation of tmux's command language. It ships a `tmux` shim, which makes it a second executable for the same protocol, not a second protocol.
+- herdr is a native multiplexer with ConPTY support on Windows and a CLI over its own socket API (`workspace create`, `pane run`, `agent attach`, `agent wait`). One implementation covers macOS, Linux and Windows, but it is a young dependency and needs a server already running.
+- `alive.sock` is a file-path socket. Node on Windows only binds named pipes (`\\.\pipe\...`), so liveness fails there no matter which multiplexer is installed. This blocks Windows support on its own.
+- Nothing else is tmux-specific: the inbox, `status.json` and `run.json` are files, and the child side only uses the extension API, so it does not care where it runs.
+
+Steps, roughly in landing order:
+
+1. Platform fixes with no abstraction: named-pipe lock path on win32, environment passed per platform instead of an `env` prefix, tolerant descriptor parsing, and an actionable error that lists the backends it looked for instead of `Failed to create tmux session`.
+2. Extract the backend behind the five operations actually used — probe, launch, attach, kill, liveness — with tmux as the only implementation and psmux selected as its executable. Bump the run record to version 2 with `{ backend, handle }` and read version 1 as tmux, because records outlive the parent that wrote them. Add a recording backend for tests so the lifecycle, reclaim and picker tests stop needing tmux.
+3. Implement herdr: check its version floor and that a server is running, launch with `workspace create` plus `pane run`, attach by focusing, and fall back to the socket for liveness.
+
+Configuration is one `terminal` key taking `auto`, `tmux`, `herdr` or `none`, overridden by `--terminal` and `PI_SUBAGENT_TERMINAL`. `auto` resolves from the environment first, not from what is installed — `HERDR_ENV` picks herdr, `TMUX` picks tmux — because attaching back to the parent only works reliably inside the multiplexer that holds it. `none` reports how to install one; a headless child needs its own work item, since the exit key, session name and editor assume a TUI.
+
+Open questions: whether herdr becomes a supported option or an undocumented auto-detect, how a detached child reports its exit code on Windows where a pane cannot outlive its process, and whether `none` should eventually mean headless rather than an error.
 
 ## Acknowledgements
 
