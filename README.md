@@ -1,6 +1,6 @@
 # Pi Subagent
 
-Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
+Observable, turn-scoped Pi subagents for independent reviews, investigations, and delegated implementation.
 
 A fork of [badlogic/pi-subagent](https://github.com/badlogic/pi-subagent), adding presets, an interactive picker, a config file, and Esc-to-interrupt.
 
@@ -89,7 +89,7 @@ Use `/subagent` to select and attach to an active child. The status widget shows
 
 Inside a child, the exit key (`ctrl+q` unless configured) returns to the parent session, whether the child is idle or working. Detaching with `ctrl+b d` still works where the child was attached rather than switched to.
 
-Pressing Esc aborts the parent turn and interrupts every child that is mid-work. Interrupted children keep their process and transcript; they return to idle and accept the next `subagent send`.
+Pressing Esc aborts the parent turn and interrupts every child that is mid-work. Interrupted children keep their transcript and accept the next `subagent send`; their turn ends when it settles.
 
 ## Configuration
 
@@ -122,7 +122,15 @@ Optional spawn flags:
 - `--no-prompt-templates`: disable prompt templates
 - `--no-context-files`: ignore repository instruction files
 
-Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.
+Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`, and a child lives only as long as its turn: when the turn settles with nothing queued, the process exits and the record stays. `send` starts a fresh process with the same history. When the spawning session quits, a running turn is stopped and its record kept. `subagent stop` moves a run to the trash and `subagent gc --purge` deletes it.
+
+## Upgrading to 0.1.4
+
+0.1.4 changes how runs are stored and how long a child lives. Both changes are breaking.
+
+- Runs use `run.json` and `status.json` instead of `metadata.json`. Directories written by 0.1.3 and earlier are ignored by `list`, `wait`, and `gc`. Remove them by hand when they are no longer needed.
+- A child exits when its turn settles and nothing is queued. `send` starts a new process with the same session history. Suspended runs are gone, and a restarted parent no longer revives children.
+- `stop` moves the run to `.trash`. `gc` lists the trash and `gc --purge` deletes it.
 
 ## Tests
 
@@ -133,6 +141,18 @@ npm run test:e2e
 ```
 
 When `tmux`, `pi`, or `node` is missing, the run exits 0 after printing `SKIP`.
+
+The reclaim test builds run directories by hand and makes no model call. It covers lock liveness, crash correction, zero-value trashing, and purge.
+
+```sh
+npm run test:reclaim
+```
+
+The lifecycle test covers the turn boundary. Without a model it kills a lock holder mid-delivery and checks that `send` cold-starts instead of reporting a lost message. With `PI_E2E_MODEL=1` it spawns a real child, quits the parent, and checks that the record reads interrupted and the process is gone.
+
+```sh
+PI_E2E_MODEL=1 npm run test:lifecycle
+```
 
 ## Acknowledgements
 

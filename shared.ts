@@ -9,20 +9,22 @@ import {
 	readdirSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, basename } from "node:path";
+import { connect, createServer, type Server } from "node:net";
 
-export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
+export type RunState = "starting" | "busy" | "idle" | "exited" | "interrupted" | "crashed" | "error";
 
-export interface RunMetadata {
+/** run.json. Written by the CLI at spawn and by rename; never by a running child. */
+export interface RunDescriptor {
 	version: 1;
 	handle: string;
 	name?: string;
 	parentSessionId?: string;
 	parentSessionFile?: string;
-	childSessionId?: string;
 	tmuxSession: string;
 	runDir: string;
 	sessionFile: string;
@@ -32,15 +34,22 @@ export interface RunMetadata {
 	thinking: string;
 	/** Extra pi CLI flags (tools, isolation) reused when the run is relaunched. */
 	launchArgs?: string[];
-	/** Set by the parent when it stops the child on quit or session switch; the child is relaunched on resume. */
-	suspended?: boolean;
-	/** tmux argv the child's exit key runs; detach when the parent attached rather than switched. */
-	exitArgv?: string[];
+	createdAt: string;
+}
+
+/** status.json. Owned by the live process; reconcile corrects it once that process is gone. */
+export interface RunStatus {
+	version: 1;
 	state: RunState;
 	hasStarted: boolean;
-	createdAt: string;
+	childSessionId?: string;
 	updatedAt: string;
 	error?: string;
+}
+
+/** view.json. tmux argv the child's exit key runs; written by whoever attached. */
+interface RunViewFile {
+	exitArgv?: string[];
 }
 
 export type InboxMessage =
@@ -188,15 +197,42 @@ export function loadConfig(cwd: string): SubagentConfig {
 	return mergeConfigs(configSources(cwd));
 }
 
-export function metadataPath(runDir: string): string {
-	return join(runDir, "metadata.json");
+const RUN_FILE = "run.json";
+const STATUS_FILE = "status.json";
+const VIEW_FILE = "view.json";
+const LOCK_FILE = "alive.sock";
+const LOCK_PROBE_TIMEOUT_MS = 250;
+const LOCK_RELEASE_POLL_MS = 50;
+const LOCK_RELEASE_TIMEOUT_MS = 3000;
+/** A run that has not bound its lock yet is booting, not dead. */
+const START_GRACE_MS = 60_000;
+const DAY_MS = 86_400_000;
+const TRASH_DIR = ".trash";
+
+export function lockPath(runDir: string): string {
+	return join(runDir, LOCK_FILE);
+}
+
+function readJson(path: string): unknown {
+	try {
+		return JSON.parse(readFileSync(path, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+function writeJson(path: string, value: unknown): void {
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	const temporary = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+	writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	renameSync(temporary, path);
 }
 
 export function inboxDir(runDir: string): string {
 	return join(runDir, "inbox");
 }
 
-export function queueInboxMessage(runDir: string, payload: InboxMessage): void {
+export function queueInboxMessage(runDir: string, payload: InboxMessage): string {
 	const queueDir = inboxDir(runDir);
 	mkdirSync(queueDir, { recursive: true, mode: 0o700 });
 	// The timestamp prefix keeps delivery ordered; the suffix prevents collisions within one millisecond.
@@ -204,6 +240,7 @@ export function queueInboxMessage(runDir: string, payload: InboxMessage): void {
 	const temporary = `${target}.tmp`;
 	writeFileSync(temporary, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
 	renameSync(temporary, target);
+	return target;
 }
 
 export function isValidRunName(value: unknown): value is string {
@@ -216,75 +253,393 @@ export function isValidRunName(value: unknown): value is string {
 	);
 }
 
-export function runDisplayName(metadata: RunMetadata): string {
-	return metadata.name ? `${metadata.name} (${metadata.handle})` : metadata.handle;
-}
-
-export function readMetadata(runDir: string): RunMetadata | undefined {
-	try {
-		const value: unknown = JSON.parse(readFileSync(metadataPath(runDir), "utf8"));
-		if (typeof value !== "object" || value === null) return undefined;
-		const metadata = value as Partial<RunMetadata>;
-		if (
-			metadata.version !== 1 ||
-			typeof metadata.handle !== "string" ||
-			(metadata.name !== undefined && !isValidRunName(metadata.name)) ||
-			typeof metadata.tmuxSession !== "string" ||
-			typeof metadata.sessionFile !== "string" ||
-			typeof metadata.runDir !== "string"
-		) {
-			return undefined;
-		}
-		return metadata as RunMetadata;
-	} catch {
+function parseDescriptor(value: unknown): RunDescriptor | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const descriptor = value as Partial<RunDescriptor>;
+	if (
+		descriptor.version !== 1 ||
+		typeof descriptor.handle !== "string" ||
+		(descriptor.name !== undefined && !isValidRunName(descriptor.name)) ||
+		typeof descriptor.tmuxSession !== "string" ||
+		typeof descriptor.sessionFile !== "string" ||
+		typeof descriptor.runDir !== "string" ||
+		typeof descriptor.createdAt !== "string"
+	) {
 		return undefined;
 	}
+	return descriptor as RunDescriptor;
 }
 
-export function writeMetadata(metadata: RunMetadata): void {
-	mkdirSync(dirname(metadataPath(metadata.runDir)), { recursive: true, mode: 0o700 });
-	const target = metadataPath(metadata.runDir);
-	const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-	writeFileSync(temporary, `${JSON.stringify(metadata, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-	renameSync(temporary, target);
-}
+const RUN_STATES = new Set<RunState>(["starting", "busy", "idle", "exited", "interrupted", "crashed", "error"]);
 
-export function updateMetadata(runDir: string, patch: Partial<RunMetadata>): RunMetadata | undefined {
-	const current = readMetadata(runDir);
-	if (!current) return undefined;
-	const next: RunMetadata = {
-		...current,
-		...patch,
+function parseStatus(value: unknown): RunStatus | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const status = value as Partial<RunStatus>;
+	if (status.version !== 1 || typeof status.state !== "string" || !RUN_STATES.has(status.state as RunState)) {
+		return undefined;
+	}
+	return {
 		version: 1,
-		handle: current.handle,
-		runDir: current.runDir,
-		updatedAt: new Date().toISOString(),
+		state: status.state as RunState,
+		hasStarted: status.hasStarted === true,
+		childSessionId: typeof status.childSessionId === "string" ? status.childSessionId : undefined,
+		updatedAt: typeof status.updatedAt === "string" ? status.updatedAt : new Date(0).toISOString(),
+		error: typeof status.error === "string" ? status.error : undefined,
 	};
-	writeMetadata(next);
-	return next;
 }
 
-export async function waitForRunShutdown(runDir: string, timeoutMs = 2000): Promise<void> {
+/** The status a directory starts with before any process writes one. */
+function initialStatus(descriptor: RunDescriptor): RunStatus {
+	return {
+		version: 1,
+		state: "starting",
+		hasStarted: false,
+		updatedAt: descriptor.createdAt,
+	};
+}
+
+export interface RunSnapshot {
+	run: Run;
+	alive: boolean;
+	state: RunState;
+}
+
+export type ReconcileAction = "none" | "crashed" | "exited" | "trashed";
+
+export interface ReconcileResult extends RunSnapshot {
+	action: ReconcileAction;
+}
+
+/**
+ * One run directory. run.json is static, status.json belongs to the live turn, view.json records
+ * how to leave. Every write for this run goes through here, so callers never join paths themselves.
+ */
+export class Run {
+	private descriptor: RunDescriptor;
+	private status: RunStatus;
+	private view: RunViewFile;
+
+	private constructor(descriptor: RunDescriptor, status: RunStatus, view: RunViewFile) {
+		this.descriptor = descriptor;
+		this.status = status;
+		this.view = view;
+	}
+
+	/** Read a run directory, or undefined when run.json is missing or unreadable. */
+	static load(runDir: string): Run | undefined {
+		const descriptor = parseDescriptor(readJson(join(runDir, RUN_FILE)));
+		if (!descriptor) return undefined;
+		const status = parseStatus(readJson(join(runDir, STATUS_FILE)));
+		const view = readJson(join(runDir, VIEW_FILE)) as RunViewFile | undefined;
+		return new Run(descriptor, status ?? initialStatus(descriptor), view ?? {});
+	}
+
+	static create(descriptor: RunDescriptor): Run {
+		const run = new Run(descriptor, initialStatus(descriptor), {});
+		writeJson(join(descriptor.runDir, RUN_FILE), descriptor);
+		run.writeStatus();
+		return run;
+	}
+
+	static find(handle: string): Run | undefined {
+		return Run.load(join(getRunsDir(), handle));
+	}
+
+	static list(parentSessionId?: string): Run[] {
+		const root = getRunsDir();
+		if (!existsSync(root)) return [];
+		const runs: Run[] = [];
+		for (const entry of readdirSync(root, { withFileTypes: true })) {
+			if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+			const run = Run.load(join(root, entry.name));
+			if (!run) continue;
+			if (parentSessionId && run.parentSessionId !== parentSessionId) continue;
+			runs.push(run);
+		}
+		return runs.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+	}
+
+	get dir(): string {
+		return this.descriptor.runDir;
+	}
+
+	get handle(): string {
+		return this.descriptor.handle;
+	}
+
+	get name(): string | undefined {
+		return this.descriptor.name;
+	}
+
+	get displayName(): string {
+		return this.name ? `${this.name} (${this.handle})` : this.handle;
+	}
+
+	get sessionFile(): string {
+		return this.descriptor.sessionFile;
+	}
+
+	get tmuxSession(): string {
+		return this.descriptor.tmuxSession;
+	}
+
+	get cwd(): string {
+		return this.descriptor.cwd;
+	}
+
+	get provider(): string {
+		return this.descriptor.provider;
+	}
+
+	get model(): string {
+		return this.descriptor.model;
+	}
+
+	get thinking(): string {
+		return this.descriptor.thinking;
+	}
+
+	get parentSessionId(): string | undefined {
+		return this.descriptor.parentSessionId;
+	}
+
+	get createdAt(): string {
+		return this.descriptor.createdAt;
+	}
+
+	get inboxDir(): string {
+		return inboxDir(this.dir);
+	}
+
+	get exitArgv(): string[] | undefined {
+		return this.view.exitArgv;
+	}
+
+	get state(): RunState {
+		return this.status.state;
+	}
+
+	get hasStarted(): boolean {
+		return this.status.hasStarted;
+	}
+
+	get updatedAt(): string {
+		return this.status.updatedAt;
+	}
+
+	get error(): string | undefined {
+		return this.status.error;
+	}
+
+	/** Patch status.json. Only the live process, or reconcile after it died, may call this. */
+	updateStatus(patch: Partial<RunStatus>): void {
+		this.status = { ...this.status, ...patch, version: 1, updatedAt: new Date().toISOString() };
+		this.writeStatus();
+	}
+
+	updateDescriptor(patch: Partial<RunDescriptor>): void {
+		this.descriptor = { ...this.descriptor, ...patch, version: 1, handle: this.handle, runDir: this.dir };
+		writeJson(join(this.dir, RUN_FILE), this.descriptor);
+	}
+
+	attach(exitArgv: string[]): void {
+		this.view = { exitArgv };
+		writeJson(join(this.dir, VIEW_FILE), this.view);
+	}
+
+	launch(initialArgs: string[] = []): void {
+		launchProcess(this.descriptor, initialArgs);
+	}
+
+	queue(payload: InboxMessage): string {
+		return queueInboxMessage(this.dir, payload);
+	}
+
+	lock(): Promise<void> {
+		return holdLock(this.dir);
+	}
+
+	unlock(): void {
+		releaseLock(this.dir);
+	}
+
+	alive(): Promise<boolean> {
+		return isAlive(this.dir);
+	}
+
+	waitForShutdown(timeoutMs?: number): Promise<boolean> {
+		return waitForRunShutdown(this.dir, timeoutMs);
+	}
+
+	trash(): string {
+		return moveToTrash(this.dir);
+	}
+
+	/** Pure read: the truth on disk plus the lock probe. Never writes. */
+	async inspect(): Promise<RunSnapshot> {
+		const alive = await this.alive();
+		return { run: this, alive, state: this.snapshotState(alive) };
+	}
+
+	/** Correct what a dead process left behind. Idempotent, and never touches a live run. */
+	async reconcile(): Promise<ReconcileResult> {
+		const snapshot = await this.inspect();
+		if (snapshot.alive) return { ...snapshot, action: "none" };
+		// A crashed process leaves the socket file behind; clear it so the next boot can bind. A run
+		// still inside its boot grace may be about to bind its own, so leave that one alone.
+		if (snapshot.state !== "starting") {
+			rmSync(lockPath(this.dir), { force: true });
+		}
+		if (this.isZeroValue() && snapshot.state !== "starting") {
+			this.trash();
+			return { ...snapshot, action: "trashed" };
+		}
+		if (snapshot.state === this.state) return { ...snapshot, action: "none" };
+		const previous = this.state;
+		const action: ReconcileAction = snapshot.state === "crashed" ? "crashed" : "exited";
+		this.updateStatus({
+			state: action,
+			error: action === "crashed" ? `Process exited while ${previous}` : this.error,
+		});
+		return { ...snapshot, action };
+	}
+
+	private writeStatus(): void {
+		writeJson(join(this.dir, STATUS_FILE), this.status);
+	}
+
+	private snapshotState(alive: boolean): RunState {
+		if (alive) return this.state;
+		if (this.state === "error") return "error";
+		// updatedAt marks the last transition into starting, so a resumed run keeps its boot grace.
+		if (this.state === "starting" && Date.now() - Date.parse(this.updatedAt) < START_GRACE_MS) {
+			return "starting";
+		}
+		if (this.state === "interrupted") return "interrupted";
+		if (this.state === "busy" || this.state === "starting") return "crashed";
+		if (this.state === "crashed") return "crashed";
+		return "exited";
+	}
+
+	private hasTranscript(): boolean {
+		try {
+			// Size, not content: a long transcript only needs an emptiness answer.
+			return statSync(this.sessionFile).size > 0;
+		} catch {
+			return false;
+		}
+	}
+
+	hasInbox(): boolean {
+		try {
+			return readdirSync(this.inboxDir).some((file) => file.endsWith(".json"));
+		} catch {
+			return false;
+		}
+	}
+
+	/** Nothing happened and nothing is queued: the record holds no history worth keeping. */
+	private isZeroValue(): boolean {
+		return !this.hasStarted && !this.hasTranscript() && !this.hasInbox();
+	}
+}
+
+export async function inspectRuns(parentSessionId?: string): Promise<RunSnapshot[]> {
+	return Promise.all(Run.list(parentSessionId).map((run) => run.inspect()));
+}
+
+export async function reconcileAll(parentSessionId?: string): Promise<ReconcileResult[]> {
+	const results: ReconcileResult[] = [];
+	for (const run of Run.list(parentSessionId)) {
+		results.push(await run.reconcile());
+	}
+	return results;
+}
+
+/**
+ * Liveness is a bound Unix socket, which the kernel releases when the process dies.
+ * tmux only carries the terminal, so a tmux restart no longer changes the answer.
+ */
+function isAlive(runDir: string): Promise<boolean> {
+	return new Promise<boolean>((resolveAlive) => {
+		const client = connect(lockPath(runDir));
+		let settled = false;
+		const finish = (alive: boolean): void => {
+			if (settled) return;
+			settled = true;
+			client.destroy();
+			resolveAlive(alive);
+		};
+		client.setTimeout(LOCK_PROBE_TIMEOUT_MS, () => finish(false));
+		client.once("connect", () => finish(true));
+		client.once("error", () => finish(false));
+	});
+}
+
+const LOCK_REGISTRY = Symbol.for("pi-subagent.locks");
+
+function lockRegistry(): Map<string, Server> {
+	const global = globalThis as typeof globalThis & { [key: symbol]: unknown };
+	if (global[LOCK_REGISTRY] instanceof Map) return global[LOCK_REGISTRY] as Map<string, Server>;
+	const registry = new Map<string, Server>();
+	global[LOCK_REGISTRY] = registry;
+	return registry;
+}
+
+function listen(path: string): Promise<Server> {
+	return new Promise<Server>((resolveListen, rejectListen) => {
+		const server = createServer((socket) => socket.destroy());
+		server.once("error", rejectListen);
+		server.listen(path, () => {
+			server.removeListener("error", rejectListen);
+			resolveListen(server);
+		});
+	});
+}
+
+/**
+ * Bind the liveness socket. The registry lives on globalThis so a /reload reuses the
+ * bound server instead of failing to bind its own path.
+ */
+async function holdLock(runDir: string): Promise<void> {
+	const path = lockPath(runDir);
+	const registry = lockRegistry();
+	if (registry.has(path)) return;
+	// A crashed process leaves the socket file behind; clear it so this boot can bind.
+	if (existsSync(path) && !(await isAlive(runDir))) {
+		rmSync(path, { force: true });
+	}
+	const server = await listen(path);
+	registry.set(path, server);
+}
+
+function releaseLock(runDir: string): void {
+	const path = lockPath(runDir);
+	const server = lockRegistry().get(path);
+	if (!server) return;
+	lockRegistry().delete(path);
+	// Unlink first: a newcomer that binds in between must not lose its socket to this cleanup.
+	rmSync(path, { force: true });
+	server.close();
+}
+
+async function waitForRunShutdown(runDir: string, timeoutMs = LOCK_RELEASE_TIMEOUT_MS): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		const metadata = readMetadata(runDir);
-		if (!metadata || metadata.state === "exited") return;
-		await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 50));
+		if (!(await isAlive(runDir))) return true;
+		await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, LOCK_RELEASE_POLL_MS));
 	}
+	return !(await isAlive(runDir));
 }
 
 export function removeRunDir(runDir: string): void {
 	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-export function tmuxSessionExists(session: string): boolean {
-	return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
-}
-
 /** Start the child pi process for a run in its tmux session. `initialArgs` are only passed on first spawn. */
-export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
+function launchProcess(descriptor: RunDescriptor, initialArgs: string[] = []): void {
 	let launcher = "pi";
-	const testLauncher = join(metadata.cwd, "pi-test.sh");
+	const testLauncher = join(descriptor.cwd, "pi-test.sh");
 	try {
 		accessSync(testLauncher, constants.X_OK);
 		launcher = testLauncher;
@@ -298,27 +653,27 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 			"new-session",
 			"-d",
 			"-s",
-			metadata.tmuxSession,
+			descriptor.tmuxSession,
 			"-x",
 			"120",
 			"-y",
 			"40",
 			"-c",
-			metadata.cwd,
+			descriptor.cwd,
 			"--",
 			"env",
-			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
-			`PI_SUBAGENT_EXIT_KEY=${loadConfig(metadata.cwd).exitKey ?? DEFAULT_EXIT_KEY}`,
+			`PI_SUBAGENT_RUN_DIR=${descriptor.runDir}`,
+			`PI_SUBAGENT_EXIT_KEY=${loadConfig(descriptor.cwd).exitKey ?? DEFAULT_EXIT_KEY}`,
 			launcher,
 			"--session",
-			metadata.sessionFile,
+			descriptor.sessionFile,
 			"--provider",
-			metadata.provider,
+			descriptor.provider,
 			"--model",
-			metadata.model,
+			descriptor.model,
 			"--thinking",
-			metadata.thinking,
-			...(metadata.launchArgs ?? []),
+			descriptor.thinking,
+			...(descriptor.launchArgs ?? []),
 			...initialArgs,
 		],
 		{ encoding: "utf8" },
@@ -326,28 +681,63 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
 }
 
-export function effectiveRunState(metadata: RunMetadata): RunState {
-	if (
-		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
-		!tmuxSessionExists(metadata.tmuxSession)
-	) {
-		return "exited";
-	}
-	return metadata.state;
+function moveToTrash(runDir: string): string {
+	mkdirSync(trashRoot(), { recursive: true, mode: 0o700 });
+	const target = join(trashRoot(), `${basename(runDir)}.${Date.now()}`);
+	renameSync(runDir, target);
+	return target;
 }
 
-export function listRuns(parentSessionId?: string): RunMetadata[] {
+export function trashRoot(): string {
+	return join(getRunsDir(), TRASH_DIR);
+}
+
+export interface TrashEntry {
+	path: string;
+	name: string;
+	trashedAt: number;
+}
+
+export function listTrash(): TrashEntry[] {
+	if (!existsSync(trashRoot())) return [];
+	const entries: TrashEntry[] = [];
+	for (const entry of readdirSync(trashRoot(), { withFileTypes: true })) {
+		if (!entry.isDirectory()) continue;
+		const stamp = Number(entry.name.slice(entry.name.lastIndexOf(".") + 1));
+		entries.push({
+			path: join(trashRoot(), entry.name),
+			name: entry.name,
+			trashedAt: Number.isFinite(stamp) ? stamp : 0,
+		});
+	}
+	return entries.sort((a, b) => a.trashedAt - b.trashedAt);
+}
+
+/** Delete trash older than the cutoff. Returns the paths removed. */
+export function purgeTrash(olderThanDays: number): string[] {
+	const cutoff = Date.now() - olderThanDays * DAY_MS;
+	const removed: string[] = [];
+	for (const entry of listTrash()) {
+		if (entry.trashedAt > cutoff) continue;
+		rmSync(entry.path, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+		removed.push(entry.path);
+	}
+	return removed;
+}
+
+/** Directories holding a run.json nobody can parse: invisible to every command, so gc names them. */
+export function listUnreadableRuns(): string[] {
 	const root = getRunsDir();
 	if (!existsSync(root)) return [];
-	const runs: RunMetadata[] = [];
+	const unreadable: string[] = [];
 	for (const entry of readdirSync(root, { withFileTypes: true })) {
-		if (!entry.isDirectory()) continue;
-		const metadata = readMetadata(join(root, entry.name));
-		if (!metadata) continue;
-		if (parentSessionId && metadata.parentSessionId !== parentSessionId) continue;
-		runs.push(metadata);
+		if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+		const runDir = join(root, entry.name);
+		// No run.json at all means a pre-descriptor layout; leaving those alone is the caller's call.
+		if (!existsSync(join(runDir, RUN_FILE))) continue;
+		if (!Run.load(runDir)) unreadable.push(entry.name);
 	}
-	return runs.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+	return unreadable;
 }
 
 function isSessionEntry(value: unknown): value is SessionEntry {

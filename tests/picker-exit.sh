@@ -96,11 +96,14 @@ wait_visible() {
 
 mkdir -p "$HANDLE_DIR/inbox"
 : >"$HANDLE_DIR/session.jsonl"
-cat >"$HANDLE_DIR/metadata.json" <<EOF
+cat >"$HANDLE_DIR/run.json" <<EOF
 {"version":1,"handle":"$HANDLE","name":"e2e","parentSessionId":"$PARENT_ID",
  "tmuxSession":"$CHILD_SESSION","runDir":"$HANDLE_DIR","sessionFile":"$HANDLE_DIR/session.jsonl",
  "cwd":"$WORKDIR","provider":"magpie","model":"mify/deepseek/deepseek-flash","thinking":"low",
- "launchArgs":[],"state":"idle","hasStarted":true,"createdAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+ "launchArgs":[],"createdAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+EOF
+cat >"$HANDLE_DIR/status.json" <<EOF
+{"version":1,"state":"idle","hasStarted":true,"updatedAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 EOF
 
 tmux new-session -d -s "$CHILD_SESSION" -x "$PANE_WIDTH" -y "$PANE_HEIGHT" -c "$WORKDIR" \
@@ -149,7 +152,7 @@ tmux send-keys -t "$DRIVER_SESSION" Enter
 wait_client_on "$CHILD_SESSION" || fail "Enter did not move the client to $CHILD_SESSION"
 ok "Enter moves the client to the child session"
 
-EXIT_ARGV=$(node -e "const m=require('$HANDLE_DIR/metadata.json');console.log(JSON.stringify(m.exitArgv))")
+EXIT_ARGV=$(node -e "const v=require('$HANDLE_DIR/view.json');console.log(JSON.stringify(v.exitArgv))")
 case "$EXIT_ARGV" in
 '["switch-client","-c","'*) ok "parent recorded a named switch back: $EXIT_ARGV" ;;
 *) fail "parent recorded no named switch back: exitArgv=$EXIT_ARGV" ;;

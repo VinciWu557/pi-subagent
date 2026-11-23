@@ -2,7 +2,7 @@
 
 // subagent.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
-import { existsSync as existsSync2, mkdirSync as mkdirSync2, readdirSync as readdirSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { spawnSync as spawnSync2 } from "node:child_process";
 import { dirname as dirname2, join as join2, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,10 +19,12 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, basename } from "node:path";
+import { connect, createServer } from "node:net";
 function getAgentDir() {
   return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 }
@@ -112,8 +114,32 @@ function mergeConfigs(sources) {
 function loadConfig(cwd) {
   return mergeConfigs(configSources(cwd));
 }
-function metadataPath(runDir) {
-  return join(runDir, "metadata.json");
+var RUN_FILE = "run.json";
+var STATUS_FILE = "status.json";
+var VIEW_FILE = "view.json";
+var LOCK_FILE = "alive.sock";
+var LOCK_PROBE_TIMEOUT_MS = 250;
+var LOCK_RELEASE_POLL_MS = 50;
+var LOCK_RELEASE_TIMEOUT_MS = 3000;
+var START_GRACE_MS = 60000;
+var DAY_MS = 86400000;
+var TRASH_DIR = ".trash";
+function lockPath(runDir) {
+  return join(runDir, LOCK_FILE);
+}
+function readJson(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return;
+  }
+}
+function writeJson(path, value) {
+  mkdirSync(dirname(path), { recursive: true, mode: 448 });
+  const temporary = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}
+`, { encoding: "utf8", mode: 384 });
+  renameSync(temporary, path);
 }
 function inboxDir(runDir) {
   return join(runDir, "inbox");
@@ -126,68 +152,315 @@ function queueInboxMessage(runDir, payload) {
   writeFileSync(temporary, `${JSON.stringify(payload)}
 `, { encoding: "utf8", mode: 384 });
   renameSync(temporary, target);
+  return target;
 }
 function isValidRunName(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 64 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
 }
-function runDisplayName(metadata) {
-  return metadata.name ? `${metadata.name} (${metadata.handle})` : metadata.handle;
-}
-function readMetadata(runDir) {
-  try {
-    const value = JSON.parse(readFileSync(metadataPath(runDir), "utf8"));
-    if (typeof value !== "object" || value === null)
-      return;
-    const metadata = value;
-    if (metadata.version !== 1 || typeof metadata.handle !== "string" || metadata.name !== undefined && !isValidRunName(metadata.name) || typeof metadata.tmuxSession !== "string" || typeof metadata.sessionFile !== "string" || typeof metadata.runDir !== "string") {
-      return;
-    }
-    return metadata;
-  } catch {
+function parseDescriptor(value) {
+  if (typeof value !== "object" || value === null)
+    return;
+  const descriptor = value;
+  if (descriptor.version !== 1 || typeof descriptor.handle !== "string" || descriptor.name !== undefined && !isValidRunName(descriptor.name) || typeof descriptor.tmuxSession !== "string" || typeof descriptor.sessionFile !== "string" || typeof descriptor.runDir !== "string" || typeof descriptor.createdAt !== "string") {
     return;
   }
+  return descriptor;
 }
-function writeMetadata(metadata) {
-  mkdirSync(dirname(metadataPath(metadata.runDir)), { recursive: true, mode: 448 });
-  const target = metadataPath(metadata.runDir);
-  const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(metadata, null, 2)}
-`, { encoding: "utf8", mode: 384 });
-  renameSync(temporary, target);
-}
-function updateMetadata(runDir, patch) {
-  const current = readMetadata(runDir);
-  if (!current)
+var RUN_STATES = new Set(["starting", "busy", "idle", "exited", "interrupted", "crashed", "error"]);
+function parseStatus(value) {
+  if (typeof value !== "object" || value === null)
     return;
-  const next = {
-    ...current,
-    ...patch,
+  const status = value;
+  if (status.version !== 1 || typeof status.state !== "string" || !RUN_STATES.has(status.state)) {
+    return;
+  }
+  return {
     version: 1,
-    handle: current.handle,
-    runDir: current.runDir,
-    updatedAt: new Date().toISOString()
+    state: status.state,
+    hasStarted: status.hasStarted === true,
+    childSessionId: typeof status.childSessionId === "string" ? status.childSessionId : undefined,
+    updatedAt: typeof status.updatedAt === "string" ? status.updatedAt : new Date(0).toISOString(),
+    error: typeof status.error === "string" ? status.error : undefined
   };
-  writeMetadata(next);
-  return next;
 }
-async function waitForRunShutdown(runDir, timeoutMs = 2000) {
+function initialStatus(descriptor) {
+  return {
+    version: 1,
+    state: "starting",
+    hasStarted: false,
+    updatedAt: descriptor.createdAt
+  };
+}
+
+class Run {
+  descriptor;
+  status;
+  view;
+  constructor(descriptor, status, view) {
+    this.descriptor = descriptor;
+    this.status = status;
+    this.view = view;
+  }
+  static load(runDir) {
+    const descriptor = parseDescriptor(readJson(join(runDir, RUN_FILE)));
+    if (!descriptor)
+      return;
+    const status = parseStatus(readJson(join(runDir, STATUS_FILE)));
+    const view = readJson(join(runDir, VIEW_FILE));
+    return new Run(descriptor, status ?? initialStatus(descriptor), view ?? {});
+  }
+  static create(descriptor) {
+    const run = new Run(descriptor, initialStatus(descriptor), {});
+    writeJson(join(descriptor.runDir, RUN_FILE), descriptor);
+    run.writeStatus();
+    return run;
+  }
+  static find(handle) {
+    return Run.load(join(getRunsDir(), handle));
+  }
+  static list(parentSessionId) {
+    const root = getRunsDir();
+    if (!existsSync(root))
+      return [];
+    const runs = [];
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith("."))
+        continue;
+      const run = Run.load(join(root, entry.name));
+      if (!run)
+        continue;
+      if (parentSessionId && run.parentSessionId !== parentSessionId)
+        continue;
+      runs.push(run);
+    }
+    return runs.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+  get dir() {
+    return this.descriptor.runDir;
+  }
+  get handle() {
+    return this.descriptor.handle;
+  }
+  get name() {
+    return this.descriptor.name;
+  }
+  get displayName() {
+    return this.name ? `${this.name} (${this.handle})` : this.handle;
+  }
+  get sessionFile() {
+    return this.descriptor.sessionFile;
+  }
+  get tmuxSession() {
+    return this.descriptor.tmuxSession;
+  }
+  get cwd() {
+    return this.descriptor.cwd;
+  }
+  get provider() {
+    return this.descriptor.provider;
+  }
+  get model() {
+    return this.descriptor.model;
+  }
+  get thinking() {
+    return this.descriptor.thinking;
+  }
+  get parentSessionId() {
+    return this.descriptor.parentSessionId;
+  }
+  get createdAt() {
+    return this.descriptor.createdAt;
+  }
+  get inboxDir() {
+    return inboxDir(this.dir);
+  }
+  get exitArgv() {
+    return this.view.exitArgv;
+  }
+  get state() {
+    return this.status.state;
+  }
+  get hasStarted() {
+    return this.status.hasStarted;
+  }
+  get updatedAt() {
+    return this.status.updatedAt;
+  }
+  get error() {
+    return this.status.error;
+  }
+  updateStatus(patch) {
+    this.status = { ...this.status, ...patch, version: 1, updatedAt: new Date().toISOString() };
+    this.writeStatus();
+  }
+  updateDescriptor(patch) {
+    this.descriptor = { ...this.descriptor, ...patch, version: 1, handle: this.handle, runDir: this.dir };
+    writeJson(join(this.dir, RUN_FILE), this.descriptor);
+  }
+  attach(exitArgv) {
+    this.view = { exitArgv };
+    writeJson(join(this.dir, VIEW_FILE), this.view);
+  }
+  launch(initialArgs = []) {
+    launchProcess(this.descriptor, initialArgs);
+  }
+  queue(payload) {
+    return queueInboxMessage(this.dir, payload);
+  }
+  lock() {
+    return holdLock(this.dir);
+  }
+  unlock() {
+    releaseLock(this.dir);
+  }
+  alive() {
+    return isAlive(this.dir);
+  }
+  waitForShutdown(timeoutMs) {
+    return waitForRunShutdown(this.dir, timeoutMs);
+  }
+  trash() {
+    return moveToTrash(this.dir);
+  }
+  async inspect() {
+    const alive = await this.alive();
+    return { run: this, alive, state: this.snapshotState(alive) };
+  }
+  async reconcile() {
+    const snapshot = await this.inspect();
+    if (snapshot.alive)
+      return { ...snapshot, action: "none" };
+    if (snapshot.state !== "starting") {
+      rmSync(lockPath(this.dir), { force: true });
+    }
+    if (this.isZeroValue() && snapshot.state !== "starting") {
+      this.trash();
+      return { ...snapshot, action: "trashed" };
+    }
+    if (snapshot.state === this.state)
+      return { ...snapshot, action: "none" };
+    const previous = this.state;
+    const action = snapshot.state === "crashed" ? "crashed" : "exited";
+    this.updateStatus({
+      state: action,
+      error: action === "crashed" ? `Process exited while ${previous}` : this.error
+    });
+    return { ...snapshot, action };
+  }
+  writeStatus() {
+    writeJson(join(this.dir, STATUS_FILE), this.status);
+  }
+  snapshotState(alive) {
+    if (alive)
+      return this.state;
+    if (this.state === "error")
+      return "error";
+    if (this.state === "starting" && Date.now() - Date.parse(this.updatedAt) < START_GRACE_MS) {
+      return "starting";
+    }
+    if (this.state === "interrupted")
+      return "interrupted";
+    if (this.state === "busy" || this.state === "starting")
+      return "crashed";
+    if (this.state === "crashed")
+      return "crashed";
+    return "exited";
+  }
+  hasTranscript() {
+    try {
+      return statSync(this.sessionFile).size > 0;
+    } catch {
+      return false;
+    }
+  }
+  hasInbox() {
+    try {
+      return readdirSync(this.inboxDir).some((file) => file.endsWith(".json"));
+    } catch {
+      return false;
+    }
+  }
+  isZeroValue() {
+    return !this.hasStarted && !this.hasTranscript() && !this.hasInbox();
+  }
+}
+async function reconcileAll(parentSessionId) {
+  const results = [];
+  for (const run of Run.list(parentSessionId)) {
+    results.push(await run.reconcile());
+  }
+  return results;
+}
+function isAlive(runDir) {
+  return new Promise((resolveAlive) => {
+    const client = connect(lockPath(runDir));
+    let settled = false;
+    const finish = (alive) => {
+      if (settled)
+        return;
+      settled = true;
+      client.destroy();
+      resolveAlive(alive);
+    };
+    client.setTimeout(LOCK_PROBE_TIMEOUT_MS, () => finish(false));
+    client.once("connect", () => finish(true));
+    client.once("error", () => finish(false));
+  });
+}
+var LOCK_REGISTRY = Symbol.for("pi-subagent.locks");
+function lockRegistry() {
+  const global = globalThis;
+  if (global[LOCK_REGISTRY] instanceof Map)
+    return global[LOCK_REGISTRY];
+  const registry = new Map;
+  global[LOCK_REGISTRY] = registry;
+  return registry;
+}
+function listen(path) {
+  return new Promise((resolveListen, rejectListen) => {
+    const server = createServer((socket) => socket.destroy());
+    server.once("error", rejectListen);
+    server.listen(path, () => {
+      server.removeListener("error", rejectListen);
+      resolveListen(server);
+    });
+  });
+}
+async function holdLock(runDir) {
+  const path = lockPath(runDir);
+  const registry = lockRegistry();
+  if (registry.has(path))
+    return;
+  if (existsSync(path) && !await isAlive(runDir)) {
+    rmSync(path, { force: true });
+  }
+  const server = await listen(path);
+  registry.set(path, server);
+}
+function releaseLock(runDir) {
+  const path = lockPath(runDir);
+  const server = lockRegistry().get(path);
+  if (!server)
+    return;
+  lockRegistry().delete(path);
+  rmSync(path, { force: true });
+  server.close();
+}
+async function waitForRunShutdown(runDir, timeoutMs = LOCK_RELEASE_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const metadata = readMetadata(runDir);
-    if (!metadata || metadata.state === "exited")
-      return;
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+    if (!await isAlive(runDir))
+      return true;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, LOCK_RELEASE_POLL_MS));
   }
+  return !await isAlive(runDir);
 }
 function removeRunDir(runDir) {
   rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
-function tmuxSessionExists(session) {
-  return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
-}
-function launchRun(metadata, initialArgs = []) {
+function launchProcess(descriptor, initialArgs = []) {
   let launcher = "pi";
-  const testLauncher = join(metadata.cwd, "pi-test.sh");
+  const testLauncher = join(descriptor.cwd, "pi-test.sh");
   try {
     accessSync(testLauncher, constants.X_OK);
     launcher = testLauncher;
@@ -196,54 +469,83 @@ function launchRun(metadata, initialArgs = []) {
     "new-session",
     "-d",
     "-s",
-    metadata.tmuxSession,
+    descriptor.tmuxSession,
     "-x",
     "120",
     "-y",
     "40",
     "-c",
-    metadata.cwd,
+    descriptor.cwd,
     "--",
     "env",
-    `PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
-    `PI_SUBAGENT_EXIT_KEY=${loadConfig(metadata.cwd).exitKey ?? DEFAULT_EXIT_KEY}`,
+    `PI_SUBAGENT_RUN_DIR=${descriptor.runDir}`,
+    `PI_SUBAGENT_EXIT_KEY=${loadConfig(descriptor.cwd).exitKey ?? DEFAULT_EXIT_KEY}`,
     launcher,
     "--session",
-    metadata.sessionFile,
+    descriptor.sessionFile,
     "--provider",
-    metadata.provider,
+    descriptor.provider,
     "--model",
-    metadata.model,
+    descriptor.model,
     "--thinking",
-    metadata.thinking,
-    ...metadata.launchArgs ?? [],
+    descriptor.thinking,
+    ...descriptor.launchArgs ?? [],
     ...initialArgs
   ], { encoding: "utf8" });
   if (result.status !== 0)
     throw new Error(result.stderr.trim() || "Failed to create tmux session");
 }
-function effectiveRunState(metadata) {
-  if ((metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") && !tmuxSessionExists(metadata.tmuxSession)) {
-    return "exited";
-  }
-  return metadata.state;
+function moveToTrash(runDir) {
+  mkdirSync(trashRoot(), { recursive: true, mode: 448 });
+  const target = join(trashRoot(), `${basename(runDir)}.${Date.now()}`);
+  renameSync(runDir, target);
+  return target;
 }
-function listRuns(parentSessionId) {
+function trashRoot() {
+  return join(getRunsDir(), TRASH_DIR);
+}
+function listTrash() {
+  if (!existsSync(trashRoot()))
+    return [];
+  const entries = [];
+  for (const entry of readdirSync(trashRoot(), { withFileTypes: true })) {
+    if (!entry.isDirectory())
+      continue;
+    const stamp = Number(entry.name.slice(entry.name.lastIndexOf(".") + 1));
+    entries.push({
+      path: join(trashRoot(), entry.name),
+      name: entry.name,
+      trashedAt: Number.isFinite(stamp) ? stamp : 0
+    });
+  }
+  return entries.sort((a, b) => a.trashedAt - b.trashedAt);
+}
+function purgeTrash(olderThanDays) {
+  const cutoff = Date.now() - olderThanDays * DAY_MS;
+  const removed = [];
+  for (const entry of listTrash()) {
+    if (entry.trashedAt > cutoff)
+      continue;
+    rmSync(entry.path, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    removed.push(entry.path);
+  }
+  return removed;
+}
+function listUnreadableRuns() {
   const root = getRunsDir();
   if (!existsSync(root))
     return [];
-  const runs = [];
+  const unreadable = [];
   for (const entry of readdirSync(root, { withFileTypes: true })) {
-    if (!entry.isDirectory())
+    if (!entry.isDirectory() || entry.name.startsWith("."))
       continue;
-    const metadata = readMetadata(join(root, entry.name));
-    if (!metadata)
+    const runDir = join(root, entry.name);
+    if (!existsSync(join(runDir, RUN_FILE)))
       continue;
-    if (parentSessionId && metadata.parentSessionId !== parentSessionId)
-      continue;
-    runs.push(metadata);
+    if (!Run.load(runDir))
+      unreadable.push(entry.name);
   }
-  return runs.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return unreadable;
 }
 function isSessionEntry(value) {
   if (typeof value !== "object" || value === null)
@@ -328,6 +630,7 @@ function usage() {
   subagent interrupt <handle>
   subagent wait <handle> [--timeout <seconds>]
   subagent stop <handle>
+  subagent gc [--older-than <days>] [--purge]
   subagent list
 
 Config: $PI_CODING_AGENT_DIR/subagents.json (~/.pi/agent), then <cwd>/.pi/subagents.json;
@@ -362,10 +665,10 @@ function runDirForHandle(handle) {
   return join2(getRunsDir(), handle);
 }
 function getRun(handle) {
-  const metadata = readMetadata(runDirForHandle(handle));
-  if (!metadata)
+  const run = Run.find(handle);
+  if (!run)
     fail(`Unknown subagent: ${handle}`);
-  return metadata;
+  return run;
 }
 function generateHandle() {
   mkdirSync2(getRunsDir(), { recursive: true, mode: 448 });
@@ -538,7 +841,7 @@ function spawnSubagent(args) {
   if (noContextFiles)
     launchArgs.push("--no-context-files");
   const now = new Date().toISOString();
-  const metadata = {
+  const descriptor = {
     version: 1,
     handle,
     name,
@@ -552,12 +855,9 @@ function spawnSubagent(args) {
     model,
     thinking,
     launchArgs,
-    state: "starting",
-    hasStarted: false,
-    createdAt: now,
-    updatedAt: now
+    createdAt: now
   };
-  writeMetadata(metadata);
+  const run = Run.create(descriptor);
   const initialArgs = files.map((file) => `@${file}`);
   if (prompts.length > 0)
     initialArgs.push(`Task:
@@ -565,36 +865,34 @@ ${prompts.join(`
 
 `)}`);
   try {
-    launchRun(metadata, initialArgs);
+    run.launch(initialArgs);
   } catch (error) {
     removeRunDir(runDir);
     throw error;
   }
-  process.stdout.write(`Spawned ${runDisplayName(metadata)}
-State: busy
+  process.stdout.write(`Spawned ${run.displayName}
+State: starting
 Attach: tmux attach -t ${tmuxSession}
 `);
 }
-function statusSubagent(args) {
+async function statusSubagent(args) {
   if (args.length !== 1)
     usage();
-  const metadata = getRun(args[0]);
-  process.stdout.write(`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})
-Attach: tmux attach -t ${metadata.tmuxSession}
+  const view = await getRun(args[0]).reconcile();
+  const { run } = view;
+  process.stdout.write(`${run.displayName}: ${view.state} (${run.provider}/${run.model}, ${run.thinking})
+Attach: tmux attach -t ${run.tmuxSession}
 `);
 }
 function renameSubagent(args) {
   if (args.length !== 2)
     usage();
-  const metadata = getRun(args[0]);
-  const name = normalizeRunName(args[1]);
-  const updated = updateMetadata(metadata.runDir, { name });
-  if (!updated)
-    fail(`Could not rename subagent: ${metadata.handle}`);
-  process.stdout.write(`Renamed ${runDisplayName(updated)}
+  const run = getRun(args[0]);
+  run.updateDescriptor({ name: normalizeRunName(args[1]) });
+  process.stdout.write(`Renamed ${run.displayName}
 `);
 }
-function sendSubagent(args) {
+async function sendSubagent(args) {
   const handle = args.shift();
   if (!handle)
     usage();
@@ -611,23 +909,68 @@ function sendSubagent(args) {
   const message = messageParts.join(" ").trim();
   if (!message)
     fail("send requires a message");
-  const metadata = getRun(handle);
-  if (!tmuxSessionExists(metadata.tmuxSession))
-    fail(`${handle} is not running`);
-  queueInboxMessage(metadata.runDir, { kind: "message", message, delivery: followUp ? "followUp" : "auto" });
-  const state = effectiveRunState(metadata);
-  const verb = followUp && state === "busy" ? "Queued follow-up for" : state === "idle" ? "Prompted" : "Steered";
-  process.stdout.write(`${verb} ${runDisplayName(metadata)}
+  const view = await getRun(handle).reconcile();
+  const { run } = view;
+  if (view.state === "error")
+    fail(run.error || `${handle} failed`);
+  const queued = run.queue({
+    kind: "message",
+    message,
+    delivery: followUp ? "followUp" : "auto"
+  });
+  let started = false;
+  if (!view.alive && view.state !== "starting") {
+    startRun(run);
+    started = true;
+  } else if (view.alive && !await delivered(queued, run)) {
+    startRun(run);
+    started = true;
+  }
+  process.stdout.write(`${sendVerb(started, followUp, view.state)} ${run.displayName}
 `);
 }
-function interruptSubagent(args) {
+function sendVerb(started, followUp, state) {
+  if (started)
+    return "Started";
+  if (followUp && state === "busy")
+    return "Queued follow-up for";
+  if (state === "idle")
+    return "Prompted";
+  return "Steered";
+}
+var DELIVERY_TIMEOUT_MS = 1500;
+var DELIVERY_POLL_MS = 50;
+async function delivered(path, run) {
+  const deadline = Date.now() + DELIVERY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (!existsSync2(path))
+      return true;
+    if (!await run.alive())
+      return false;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, DELIVERY_POLL_MS));
+  }
+  return true;
+}
+function startRun(run) {
+  spawnSync2("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
+  run.updateStatus({ state: "starting", error: undefined });
+  try {
+    run.launch();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    run.updateStatus({ state: "error", error: message });
+    fail(`Could not start ${run.displayName}: ${message}`);
+  }
+}
+async function interruptSubagent(args) {
   if (args.length !== 1)
     usage();
-  const metadata = getRun(args[0]);
-  if (!tmuxSessionExists(metadata.tmuxSession))
-    fail(`${metadata.handle} is not running`);
-  queueInboxMessage(metadata.runDir, { kind: "interrupt" });
-  process.stdout.write(`Interrupted ${runDisplayName(metadata)}
+  const view = await getRun(args[0]).reconcile();
+  const { run } = view;
+  if (!view.alive && view.state !== "starting")
+    fail(`${run.handle} is not running`);
+  run.queue({ kind: "interrupt" });
+  process.stdout.write(`Interrupted ${run.displayName}
 `);
 }
 function parseTimeout(args) {
@@ -647,52 +990,105 @@ async function waitSubagent(args) {
   const timeoutSeconds = parseTimeout(args);
   const deadline = Date.now() + timeoutSeconds * 1000;
   while (Date.now() < deadline) {
-    const metadata = getRun(handle);
-    const pending = existsSync2(inboxDir(metadata.runDir)) ? readdirSync2(inboxDir(metadata.runDir)).some((file) => file.endsWith(".json")) : false;
-    const state = effectiveRunState(metadata);
+    const view = await getRun(handle).reconcile();
+    const { run } = view;
+    const state = view.state;
     if (state === "error")
-      fail(metadata.error || `${handle} failed`);
-    if (state === "exited")
+      fail(run.error || `${handle} failed`);
+    if (state === "crashed")
+      fail(`${handle} crashed before finishing`);
+    if (state === "starting" || view.alive) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+      continue;
+    }
+    if (!run.hasStarted)
       fail(`${handle} exited before finishing`);
-    if (metadata.hasStarted && state === "idle" && !pending) {
-      const message = readLatestAssistant(metadata.sessionFile);
-      if (!message)
-        fail(`${handle} finished without an assistant response`);
-      process.stdout.write(`${handle} finished
+    const message = readLatestAssistant(run.sessionFile);
+    if (!message)
+      fail(`${handle} finished without an assistant response`);
+    process.stdout.write(`${handle} finished
 
 ${assistantText(message)}
 `);
-      if (message.stopReason === "error" || message.stopReason === "aborted")
-        process.exitCode = 1;
-      return;
-    }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+    if (message.stopReason === "error" || message.stopReason === "aborted")
+      process.exitCode = 1;
+    return;
   }
   fail(`Timed out after ${timeoutSeconds}s waiting for ${handle}`);
 }
 async function stopSubagent(args) {
   if (args.length !== 1)
     usage();
-  const metadata = getRun(args[0]);
-  const wasRunning = tmuxSessionExists(metadata.tmuxSession);
-  spawnSync2("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
-  if (wasRunning)
-    await waitForRunShutdown(metadata.runDir);
-  removeRunDir(metadata.runDir);
-  process.stdout.write(`Stopped ${runDisplayName(metadata)}
+  const run = getRun(args[0]);
+  if (await run.alive()) {
+    spawnSync2("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
+    if (!await run.waitForShutdown())
+      fail(`${run.handle} did not stop`);
+  }
+  run.trash();
+  process.stdout.write(`Stopped ${run.displayName} (moved to trash)
 `);
 }
-function listSubagents(args) {
+var DAY_MS2 = 86400000;
+async function gcSubagents(args) {
+  let purge = false;
+  let olderThanDays = 0;
+  for (let i = 0;i < args.length; i++) {
+    switch (args[i]) {
+      case "--purge":
+        purge = true;
+        break;
+      case "--older-than": {
+        const value = Number(valueAfter(args, i, "--older-than"));
+        if (!Number.isFinite(value) || value < 0)
+          fail("--older-than must be a non-negative number of days");
+        olderThanDays = value;
+        i++;
+        break;
+      }
+      default:
+        usage();
+    }
+  }
+  for (const { run, state, action } of await reconcileAll()) {
+    if (action === "none")
+      continue;
+    process.stdout.write(`${run.displayName}  ${state}  ${action}
+`);
+  }
+  const cutoff = Date.now() - olderThanDays * DAY_MS2;
+  const unreadable = listUnreadableRuns();
+  if (unreadable.length > 0) {
+    process.stdout.write(`${unreadable.length} unreadable record(s), left in place: ${unreadable.join(", ")}
+`);
+  }
+  const trash = listTrash();
+  const expired = trash.filter((entry) => entry.trashedAt <= cutoff);
+  if (purge) {
+    process.stdout.write(`Purged ${purgeTrash(olderThanDays).length} trashed run(s)
+`);
+    return;
+  }
+  for (const entry of trash) {
+    const age = Math.max(0, Math.round((Date.now() - entry.trashedAt) / DAY_MS2));
+    const kept = entry.trashedAt > cutoff ? "  (kept)" : "";
+    process.stdout.write(`${entry.name}  trashed ${age}d ago${kept}
+`);
+  }
+  process.stdout.write(`Dry run. ${expired.length} trashed run(s) would be purged with --purge.
+`);
+}
+async function listSubagents(args) {
   if (args.length !== 0)
     usage();
-  const runs = listRuns(process.env.PI_SESSION_ID || undefined);
+  const runs = await reconcileAll(process.env.PI_SESSION_ID || undefined);
   if (runs.length === 0) {
     process.stdout.write(`No subagents
 `);
     return;
   }
-  for (const metadata of runs) {
-    process.stdout.write(`${runDisplayName(metadata)}  ${effectiveRunState(metadata).padEnd(8)}  ${metadata.provider}/${metadata.model}  ${metadata.thinking}
+  for (const { run, state } of runs) {
+    process.stdout.write(`${run.displayName}  ${state.padEnd(8)}  ${run.provider}/${run.model}  ${run.thinking}
 `);
   }
 }
@@ -704,16 +1100,16 @@ async function main() {
       spawnSubagent(args);
       break;
     case "status":
-      statusSubagent(args);
+      await statusSubagent(args);
       break;
     case "rename":
       renameSubagent(args);
       break;
     case "send":
-      sendSubagent(args);
+      await sendSubagent(args);
       break;
     case "interrupt":
-      interruptSubagent(args);
+      await interruptSubagent(args);
       break;
     case "wait":
       await waitSubagent(args);
@@ -721,8 +1117,11 @@ async function main() {
     case "stop":
       await stopSubagent(args);
       break;
+    case "gc":
+      await gcSubagents(args);
+      break;
     case "list":
-      listSubagents(args);
+      await listSubagents(args);
       break;
     default:
       usage();

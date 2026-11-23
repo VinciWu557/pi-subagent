@@ -74,7 +74,7 @@ Three additional built-in tools are available but off by default:
 - `--no-prompt-templates` - Disable prompt-template commands. Usually unnecessary, but useful when testing a minimal child environment.
 - `--no-context-files` - Ignore repository instruction files such as `AGENTS.md` and `CLAUDE.md`. Use only when those instructions would bias an independent investigation. Do not use for implementation unless intentionally bypassing repository guidance.
 
-Spawn prints a random handle and the exact tmux attach command. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended and relaunched idle with their history when that session is resumed. They are only removed by `subagent stop`.
+Spawn prints a random handle and the exact tmux attach command. Keep the handle for later commands. A child lives for one turn: when its turn settles and nothing is queued, the process exits on its own. The record and transcript stay, so `send` starts a fresh process with the same history. A running child survives `/reload`. When the spawning Pi session quits, any turn still running is stopped and the record is kept. `subagent stop` moves the record to the trash and `subagent gc --purge` deletes it.
 
 ## Inspect and wait
 
@@ -86,7 +86,7 @@ subagent wait <handle>
 
 Run `subagent list` at any time to rediscover active subagents and their handles, names, and current states if you no longer remember them.
 
-`wait` follows the durable session state and prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
+`wait` waits for the turn to settle and its process to leave, then prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
 
 ## Communicate
 
@@ -113,7 +113,7 @@ Use `/subagent`, or press `←` on an empty parent prompt, to pick a child. The 
 subagent interrupt <handle>
 ```
 
-Aborts the child's current turn and leaves the process, transcript, and metadata intact; the child returns to idle. The parent does this on its own for every busy child when the user presses Esc, so interrupt a child directly only when the user asks for one subagent to stop while the rest keep working.
+Aborts the child's current turn. The record and transcript stay, and the child exits once that turn settles unless another message is queued. The parent does this on its own for every busy child when the user presses Esc, so interrupt a child directly only when the user asks for one subagent to stop while the rest keep working.
 
 ## Stop
 
@@ -121,6 +121,16 @@ Aborts the child's current turn and leaves the process, transcript, and metadata
 subagent stop <handle>
 ```
 
-Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This terminates tmux and removes the run transcript and metadata. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
+Stop a subagent when its history is no longer needed. This kills any running turn and moves the record to `~/.pi/agent/subagents/.trash`, transcript included; `subagent gc --purge` deletes it for good. A finished turn needs no stop: its process is already gone.
+
+## Reclaim
+
+```sh
+subagent gc                       # dry run: reconcile dead records, list the trash
+subagent gc --purge               # delete everything in the trash
+subagent gc --purge --older-than 7
+```
+
+`gc` reconciles first. A record whose process is gone reads `crashed` instead of holding a stale `busy`, and a record that never started and queued nothing moves straight to the trash. Liveness comes from a socket the child process holds, so a tmux restart no longer turns a live run into a dead one. A settled turn exits by itself, so most records are already cool before anyone runs `gc`. `list` and `status` reconcile too, and `gc` without `--purge` only reports. A directory whose `run.json` cannot be parsed is invisible to the other commands, so `gc` names it and leaves it alone.
 
 The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting one suspends the current Pi TUI and attaches to its tmux session; detaching returns to the parent Pi. When the parent already runs inside tmux, selection switches the current tmux client instead.

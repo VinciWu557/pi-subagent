@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,27 +9,23 @@ import {
 	assistantText,
 	CHOICE_FIELDS,
 	configSources,
-	effectiveRunState,
 	getRunsDir,
 	inboxDir,
-	launchRun,
-	listRuns,
+	listTrash,
+	listUnreadableRuns,
 	mergeConfigs,
-	queueInboxMessage,
+	purgeTrash,
 	readLatestAssistant,
-	readMetadata,
 	removeRunDir,
-	runDisplayName,
+	reconcileAll,
+	Run,
 	isValidRunName,
 	type ChoiceField,
 	type ConfigSource,
 	type ModelChoice,
-	type RunMetadata,
+	type RunDescriptor,
+	type RunState,
 	type SubagentConfig,
-	tmuxSessionExists,
-	updateMetadata,
-	waitForRunShutdown,
-	writeMetadata,
 } from "./shared.ts";
 
 const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -58,6 +54,7 @@ function usage(): never {
   subagent interrupt <handle>
   subagent wait <handle> [--timeout <seconds>]
   subagent stop <handle>
+  subagent gc [--older-than <days>] [--purge]
   subagent list
 
 Config: $PI_CODING_AGENT_DIR/subagents.json (~/.pi/agent), then <cwd>/.pi/subagents.json;
@@ -91,10 +88,10 @@ function runDirForHandle(handle: string): string {
 	return join(getRunsDir(), handle);
 }
 
-function getRun(handle: string): RunMetadata {
-	const metadata = readMetadata(runDirForHandle(handle));
-	if (!metadata) fail(`Unknown subagent: ${handle}`);
-	return metadata;
+function getRun(handle: string): Run {
+	const run = Run.find(handle);
+	if (!run) fail(`Unknown subagent: ${handle}`);
+	return run;
 }
 
 function generateHandle(): string {
@@ -290,7 +287,7 @@ function spawnSubagent(args: string[]): void {
 	if (noContextFiles) launchArgs.push("--no-context-files");
 
 	const now = new Date().toISOString();
-	const metadata: RunMetadata = {
+	const descriptor: RunDescriptor = {
 		version: 1,
 		handle,
 		name,
@@ -304,43 +301,39 @@ function spawnSubagent(args: string[]): void {
 		model,
 		thinking,
 		launchArgs,
-		state: "starting",
-		hasStarted: false,
 		createdAt: now,
-		updatedAt: now,
 	};
-	writeMetadata(metadata);
+	const run = Run.create(descriptor);
 
 	const initialArgs = files.map((file) => `@${file}`);
 	if (prompts.length > 0) initialArgs.push(`Task:\n${prompts.join("\n\n")}`);
 	try {
-		launchRun(metadata, initialArgs);
+		run.launch(initialArgs);
 	} catch (error) {
 		removeRunDir(runDir);
 		throw error;
 	}
 
-	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: tmux attach -t ${tmuxSession}\n`);
+	process.stdout.write(`Spawned ${run.displayName}\nState: starting\nAttach: tmux attach -t ${tmuxSession}\n`);
 }
 
-function statusSubagent(args: string[]): void {
+async function statusSubagent(args: string[]): Promise<void> {
 	if (args.length !== 1) usage();
-	const metadata = getRun(args[0]);
+	const view = await getRun(args[0]).reconcile();
+	const { run } = view;
 	process.stdout.write(
-		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})\nAttach: tmux attach -t ${metadata.tmuxSession}\n`,
+		`${run.displayName}: ${view.state} (${run.provider}/${run.model}, ${run.thinking})\nAttach: tmux attach -t ${run.tmuxSession}\n`,
 	);
 }
 
 function renameSubagent(args: string[]): void {
 	if (args.length !== 2) usage();
-	const metadata = getRun(args[0]);
-	const name = normalizeRunName(args[1]);
-	const updated = updateMetadata(metadata.runDir, { name });
-	if (!updated) fail(`Could not rename subagent: ${metadata.handle}`);
-	process.stdout.write(`Renamed ${runDisplayName(updated)}\n`);
+	const run = getRun(args[0]);
+	run.updateDescriptor({ name: normalizeRunName(args[1]) });
+	process.stdout.write(`Renamed ${run.displayName}\n`);
 }
 
-function sendSubagent(args: string[]): void {
+async function sendSubagent(args: string[]): Promise<void> {
 	const handle = args.shift();
 	if (!handle) usage();
 	let followUp = false;
@@ -352,22 +345,74 @@ function sendSubagent(args: string[]): void {
 	}
 	const message = messageParts.join(" ").trim();
 	if (!message) fail("send requires a message");
-	const metadata = getRun(handle);
-	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${handle} is not running`);
+	const view = await getRun(handle).reconcile();
+	const { run } = view;
+	if (view.state === "error") fail(run.error || `${handle} failed`);
 
-	queueInboxMessage(metadata.runDir, { kind: "message", message, delivery: followUp ? "followUp" : "auto" });
+	const queued = run.queue({
+		kind: "message",
+		message,
+		delivery: followUp ? "followUp" : "auto",
+	});
 
-	const state = effectiveRunState(metadata);
-	const verb = followUp && state === "busy" ? "Queued follow-up for" : state === "idle" ? "Prompted" : "Steered";
-	process.stdout.write(`${verb} ${runDisplayName(metadata)}\n`);
+	// No lock and not booting means the process is gone: start it and let the inbox drain.
+	let started = false;
+	if (!view.alive && view.state !== "starting") {
+		startRun(run);
+		started = true;
+	} else if (view.alive && !(await delivered(queued, run))) {
+		// It settled and left between our probe and its inbox poll. The file is still queued.
+		startRun(run);
+		started = true;
+	}
+
+	process.stdout.write(`${sendVerb(started, followUp, view.state)} ${run.displayName}\n`);
 }
 
-function interruptSubagent(args: string[]): void {
+/** Why the message will run when it will, in one word, from the caller's point of view. */
+function sendVerb(started: boolean, followUp: boolean, state: RunState): string {
+	if (started) return "Started";
+	if (followUp && state === "busy") return "Queued follow-up for";
+	if (state === "idle") return "Prompted";
+	return "Steered";
+}
+
+/** How long a live run gets to take a queued file before we assume it is leaving. */
+const DELIVERY_TIMEOUT_MS = 1500;
+const DELIVERY_POLL_MS = 50;
+
+/** True once the child removed the queued file; false when its lock dropped first. */
+async function delivered(path: string, run: Run): Promise<boolean> {
+	const deadline = Date.now() + DELIVERY_TIMEOUT_MS;
+	while (Date.now() < deadline) {
+		if (!existsSync(path)) return true;
+		if (!(await run.alive())) return false;
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, DELIVERY_POLL_MS));
+	}
+	// Still alive and slow: its next poll takes the file.
+	return true;
+}
+
+/** A dead run keeps its tmux name; the fresh process needs it back. */
+function startRun(run: Run): void {
+	spawnSync("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
+	run.updateStatus({ state: "starting", error: undefined });
+	try {
+		run.launch();
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		run.updateStatus({ state: "error", error: message });
+		fail(`Could not start ${run.displayName}: ${message}`);
+	}
+}
+
+async function interruptSubagent(args: string[]): Promise<void> {
 	if (args.length !== 1) usage();
-	const metadata = getRun(args[0]);
-	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${metadata.handle} is not running`);
-	queueInboxMessage(metadata.runDir, { kind: "interrupt" });
-	process.stdout.write(`Interrupted ${runDisplayName(metadata)}\n`);
+	const view = await getRun(args[0]).reconcile();
+	const { run } = view;
+	if (!view.alive && view.state !== "starting") fail(`${run.handle} is not running`);
+	run.queue({ kind: "interrupt" });
+	process.stdout.write(`Interrupted ${run.displayName}\n`);
 }
 
 function parseTimeout(args: string[]): number {
@@ -385,45 +430,94 @@ async function waitSubagent(args: string[]): Promise<void> {
 	const deadline = Date.now() + timeoutSeconds * 1000;
 
 	while (Date.now() < deadline) {
-		const metadata = getRun(handle);
-		const pending = existsSync(inboxDir(metadata.runDir))
-			? readdirSync(inboxDir(metadata.runDir)).some((file) => file.endsWith(".json"))
-			: false;
-		const state = effectiveRunState(metadata);
-		if (state === "error") fail(metadata.error || `${handle} failed`);
-		if (state === "exited") fail(`${handle} exited before finishing`);
-		if (metadata.hasStarted && state === "idle" && !pending) {
-			const message = readLatestAssistant(metadata.sessionFile);
-			if (!message) fail(`${handle} finished without an assistant response`);
-			process.stdout.write(`${handle} finished\n\n${assistantText(message)}\n`);
-			if (message.stopReason === "error" || message.stopReason === "aborted") process.exitCode = 1;
-			return;
+		const view = await getRun(handle).reconcile();
+		const { run } = view;
+		const state = view.state;
+		if (state === "error") fail(run.error || `${handle} failed`);
+		if (state === "crashed") fail(`${handle} crashed before finishing`);
+		// A booting child has no lock yet, which is not the same as a finished turn.
+		if (state === "starting" || view.alive) {
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+			continue;
 		}
-		await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+		// No lock and past the boot grace: the process is gone, so the turn is over.
+		if (!run.hasStarted) fail(`${handle} exited before finishing`);
+		const message = readLatestAssistant(run.sessionFile);
+		if (!message) fail(`${handle} finished without an assistant response`);
+		process.stdout.write(`${handle} finished\n\n${assistantText(message)}\n`);
+		if (message.stopReason === "error" || message.stopReason === "aborted") process.exitCode = 1;
+		return;
 	}
 	fail(`Timed out after ${timeoutSeconds}s waiting for ${handle}`);
 }
 
 async function stopSubagent(args: string[]): Promise<void> {
 	if (args.length !== 1) usage();
-	const metadata = getRun(args[0]);
-	const wasRunning = tmuxSessionExists(metadata.tmuxSession);
-	spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
-	if (wasRunning) await waitForRunShutdown(metadata.runDir);
-	removeRunDir(metadata.runDir);
-	process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+	const run = getRun(args[0]);
+	if (await run.alive()) {
+		spawnSync("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
+		if (!(await run.waitForShutdown())) fail(`${run.handle} did not stop`);
+	}
+	run.trash();
+	process.stdout.write(`Stopped ${run.displayName} (moved to trash)\n`);
 }
 
-function listSubagents(args: string[]): void {
+const DAY_MS = 86_400_000;
+
+async function gcSubagents(args: string[]): Promise<void> {
+	let purge = false;
+	let olderThanDays = 0;
+	for (let i = 0; i < args.length; i++) {
+		switch (args[i]) {
+			case "--purge":
+				purge = true;
+				break;
+			case "--older-than": {
+				const value = Number(valueAfter(args, i, "--older-than"));
+				if (!Number.isFinite(value) || value < 0) fail("--older-than must be a non-negative number of days");
+				olderThanDays = value;
+				i++;
+				break;
+			}
+			default:
+				usage();
+		}
+	}
+
+	for (const { run, state, action } of await reconcileAll()) {
+		if (action === "none") continue;
+		process.stdout.write(`${run.displayName}  ${state}  ${action}\n`);
+	}
+
+	const cutoff = Date.now() - olderThanDays * DAY_MS;
+	const unreadable = listUnreadableRuns();
+	if (unreadable.length > 0) {
+		process.stdout.write(`${unreadable.length} unreadable record(s), left in place: ${unreadable.join(", ")}\n`);
+	}
+	const trash = listTrash();
+	const expired = trash.filter((entry) => entry.trashedAt <= cutoff);
+	if (purge) {
+		process.stdout.write(`Purged ${purgeTrash(olderThanDays).length} trashed run(s)\n`);
+		return;
+	}
+	for (const entry of trash) {
+		const age = Math.max(0, Math.round((Date.now() - entry.trashedAt) / DAY_MS));
+		const kept = entry.trashedAt > cutoff ? "  (kept)" : "";
+		process.stdout.write(`${entry.name}  trashed ${age}d ago${kept}\n`);
+	}
+	process.stdout.write(`Dry run. ${expired.length} trashed run(s) would be purged with --purge.\n`);
+}
+
+async function listSubagents(args: string[]): Promise<void> {
 	if (args.length !== 0) usage();
-	const runs = listRuns(process.env.PI_SESSION_ID || undefined);
+	const runs = await reconcileAll(process.env.PI_SESSION_ID || undefined);
 	if (runs.length === 0) {
 		process.stdout.write("No subagents\n");
 		return;
 	}
-	for (const metadata of runs) {
+	for (const { run, state } of runs) {
 		process.stdout.write(
-			`${runDisplayName(metadata)}  ${effectiveRunState(metadata).padEnd(8)}  ${metadata.provider}/${metadata.model}  ${metadata.thinking}\n`,
+			`${run.displayName}  ${state.padEnd(8)}  ${run.provider}/${run.model}  ${run.thinking}\n`,
 		);
 	}
 }
@@ -436,16 +530,16 @@ async function main(): Promise<void> {
 			spawnSubagent(args);
 			break;
 		case "status":
-			statusSubagent(args);
+			await statusSubagent(args);
 			break;
 		case "rename":
 			renameSubagent(args);
 			break;
 		case "send":
-			sendSubagent(args);
+			await sendSubagent(args);
 			break;
 		case "interrupt":
-			interruptSubagent(args);
+			await interruptSubagent(args);
 			break;
 		case "wait":
 			await waitSubagent(args);
@@ -453,8 +547,11 @@ async function main(): Promise<void> {
 		case "stop":
 			await stopSubagent(args);
 			break;
+		case "gc":
+			await gcSubagents(args);
+			break;
 		case "list":
-			listSubagents(args);
+			await listSubagents(args);
 			break;
 		default:
 			usage();

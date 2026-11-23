@@ -1,6 +1,6 @@
 {
   "name": "@vinciwu557/pi-subagent",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation",
   "keywords": [
     "pi-package"
@@ -24,7 +24,9 @@
   "scripts": {
     "build": "bun build subagent.ts --target node --outfile subagent.js",
     "prepack": "npm run build",
-    "test:e2e": "bash tests/picker-exit.sh"
+    "test:e2e": "bash tests/picker-exit.sh",
+    "test:reclaim": "bash tests/reclaim.sh",
+    "test:lifecycle": "bash tests/lifecycle.sh"
   },
   "bin": {
     "subagent": "subagent.js"
