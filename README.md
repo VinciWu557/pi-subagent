@@ -102,7 +102,7 @@ One JSON file, read by both the CLI and every child it spawns:
 
 ```json
 {
-  "defaults": { "provider": "magpie", "model": "mify/deepseek/deepseek-flash", "thinking": "low" },
+  "defaults": { "provider": "magpie", "model": "deepseek/deepseek-flash", "thinking": "low" },
   "presets": {
     "review": { "provider": "openai-codex", "model": "gpt-5.4-high", "thinking": "high" },
     "cheap": { "model": "deepseek/deepseek-flash", "thinking": "off" }
