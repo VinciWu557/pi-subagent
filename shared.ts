@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
 	accessSync,
+	appendFileSync,
 	constants,
 	existsSync,
 	mkdirSync,
@@ -35,6 +36,8 @@ export interface RunDescriptor {
 	/** Extra pi CLI flags (tools, isolation) reused when the run is relaunched. */
 	launchArgs?: string[];
 	createdAt: string;
+	/** Pane pid recorded at spawn, so a child that dies before it can report still counts as dead. */
+	pid?: number;
 }
 
 /** status.json. Owned by the live process; reconcile corrects it once that process is gone. */
@@ -45,6 +48,8 @@ export interface RunStatus {
 	childSessionId?: string;
 	updatedAt: string;
 	error?: string;
+	/** The child's own pid, written once it has a session. */
+	pid?: number;
 }
 
 /** view.json. tmux argv the child's exit key runs; written by whoever attached. */
@@ -199,6 +204,8 @@ export function loadConfig(cwd: string): SubagentConfig {
 
 const RUN_FILE = "run.json";
 const STATUS_FILE = "status.json";
+const EVENTS_FILE = "events.jsonl";
+const DELIVERED_FILE = "delivered.json";
 const VIEW_FILE = "view.json";
 const LOCK_FILE = "alive.sock";
 const LOCK_PROBE_TIMEOUT_MS = 250;
@@ -206,6 +213,7 @@ const LOCK_RELEASE_POLL_MS = 50;
 const LOCK_RELEASE_TIMEOUT_MS = 3000;
 /** A run that has not bound its lock yet is booting, not dead. */
 const START_GRACE_MS = 60_000;
+const CRASH_FILE = "crashed.json";
 const DAY_MS = 86_400_000;
 const TRASH_DIR = ".trash";
 
@@ -241,6 +249,123 @@ export function queueInboxMessage(runDir: string, payload: InboxMessage): string
 	writeFileSync(temporary, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
 	renameSync(temporary, target);
 	return target;
+}
+
+/**
+ * Completions leave the child as append-only lines, not as a status flip the parent has to
+ * interpret: a settle and a crash both change status.json, and only one of them has a result.
+ */
+export type RunEventKind = "settled" | "aborted";
+
+export interface RunEvent {
+	version: 1;
+	seq: number;
+	kind: RunEventKind;
+	at: string;
+	text: string;
+}
+
+export function eventsPath(runDir: string): string {
+	return join(runDir, EVENTS_FILE);
+}
+
+/** A watcher gets every write under the runs root; only completion lines wake the parent. */
+export function isEventsFile(file: string): boolean {
+	return file.endsWith(`/${EVENTS_FILE}`) || file === EVENTS_FILE;
+}
+
+function isRunEvent(value: unknown): value is RunEvent {
+	if (typeof value !== "object" || value === null) return false;
+	const event = value as Partial<RunEvent>;
+	return (
+		event.version === 1 &&
+		typeof event.seq === "number" &&
+		(event.kind === "settled" || event.kind === "aborted") &&
+		typeof event.at === "string" &&
+		typeof event.text === "string"
+	);
+}
+
+export function readRunEvents(runDir: string): RunEvent[] {
+	let content: string;
+	try {
+		content = readFileSync(eventsPath(runDir), "utf8");
+	} catch {
+		return [];
+	}
+	const events: RunEvent[] = [];
+	for (const line of content.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const value: unknown = JSON.parse(line);
+			if (isRunEvent(value)) events.push(value);
+		} catch {
+			// The last line can be mid-write; the next read picks it up whole.
+		}
+	}
+	return events;
+}
+
+/** The child is the only writer, so seq only has to grow within one run directory. */
+export function appendRunEvent(runDir: string, kind: RunEventKind, text: string): RunEvent {
+	const seq = (readRunEvents(runDir).at(-1)?.seq ?? 0) + 1;
+	const event: RunEvent = { version: 1, seq, kind, at: new Date().toISOString(), text };
+	mkdirSync(runDir, { recursive: true, mode: 0o700 });
+	appendFileSync(eventsPath(runDir), `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
+	return event;
+}
+
+/** Highest event seq the parent has already put into its own context. */
+export function readDeliveredSeq(runDir: string): number {
+	const value = readJson(join(runDir, DELIVERED_FILE)) as { version?: unknown; seq?: unknown } | undefined;
+	return value?.version === 1 && typeof value.seq === "number" ? value.seq : 0;
+}
+
+/**
+ * A crash is observed by the parent, so it cannot share the child's event sequence: the child might
+ * still be alive and writing. One marker file per run keeps the notice at-most-once.
+ */
+export function wasCrashNotified(runDir: string): boolean {
+	const value = readJson(join(runDir, CRASH_FILE)) as { version?: unknown; kind?: unknown } | undefined;
+	return value?.version === 1 && typeof value.kind === "string";
+}
+
+/** Returns false when another tick (or a previous parent) already reported this run. */
+export function markCrashNotified(runDir: string, kind: string): boolean {
+	mkdirSync(runDir, { recursive: true, mode: 0o700 });
+	try {
+		writeFileSync(
+			join(runDir, CRASH_FILE),
+			JSON.stringify({ version: 1, kind, at: new Date().toISOString() }),
+			{ encoding: "utf8", mode: 0o600, flag: "wx" },
+		);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+		throw error;
+	}
+}
+
+/** EPERM means the pid exists but belongs to another user, which still counts as alive. */
+export function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/** `tmux` runs the child directly, so the pane pid is the child's pid. */
+function panePid(tmuxSession: string): number | undefined {
+	const result = spawnSync("tmux", ["list-panes", "-t", tmuxSession, "-F", "#{pane_pid}"], { encoding: "utf8" });
+	if (result.status !== 0) return undefined;
+	const pid = Number.parseInt(result.stdout.trim(), 10);
+	return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+export function markDelivered(runDir: string, seq: number): void {
+	writeJson(join(runDir, DELIVERED_FILE), { version: 1, seq, at: new Date().toISOString() });
 }
 
 export function isValidRunName(value: unknown): value is string {
@@ -285,6 +410,7 @@ function parseStatus(value: unknown): RunStatus | undefined {
 		childSessionId: typeof status.childSessionId === "string" ? status.childSessionId : undefined,
 		updatedAt: typeof status.updatedAt === "string" ? status.updatedAt : new Date(0).toISOString(),
 		error: typeof status.error === "string" ? status.error : undefined,
+		pid: typeof status.pid === "number" ? status.pid : undefined,
 	};
 }
 
@@ -345,15 +471,19 @@ export class Run {
 		return Run.load(join(getRunsDir(), handle));
 	}
 
-	static list(parentSessionId?: string): Run[] {
+	static list(parentSessionId?: string, parentSessionFile?: string): Run[] {
 		const root = getRunsDir();
 		if (!existsSync(root)) return [];
 		const runs: Run[] = [];
+		// A resumed session gets a fresh id for the same file, so either one is enough to claim a run.
+		const mine = (run: Run): boolean =>
+			!parentSessionId ||
+			run.parentSessionId === parentSessionId ||
+			(parentSessionFile !== undefined && run.parentSessionFile === parentSessionFile);
 		for (const entry of readdirSync(root, { withFileTypes: true })) {
 			if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
 			const run = Run.load(join(root, entry.name));
-			if (!run) continue;
-			if (parentSessionId && run.parentSessionId !== parentSessionId) continue;
+			if (!run || !mine(run)) continue;
 			runs.push(run);
 		}
 		return runs.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -403,6 +533,10 @@ export class Run {
 		return this.descriptor.parentSessionId;
 	}
 
+	get parentSessionFile(): string | undefined {
+		return this.descriptor.parentSessionFile;
+	}
+
 	get createdAt(): string {
 		return this.descriptor.createdAt;
 	}
@@ -449,6 +583,14 @@ export class Run {
 
 	launch(initialArgs: string[] = []): void {
 		launchProcess(this.descriptor, initialArgs);
+		// Recorded here so a child that dies before its first turn is still visibly dead, not
+		// "starting" until the boot grace expires.
+		const pid = panePid(this.descriptor.tmuxSession);
+		if (pid !== undefined) this.updateDescriptor({ pid });
+	}
+
+	get pid(): number | undefined {
+		return this.status.pid ?? this.descriptor.pid;
 	}
 
 	queue(payload: InboxMessage): string {
@@ -544,13 +686,13 @@ export class Run {
 	}
 }
 
-export async function inspectRuns(parentSessionId?: string): Promise<RunSnapshot[]> {
-	return Promise.all(Run.list(parentSessionId).map((run) => run.inspect()));
+export async function inspectRuns(parentSessionId?: string, parentSessionFile?: string): Promise<RunSnapshot[]> {
+	return Promise.all(Run.list(parentSessionId, parentSessionFile).map((run) => run.inspect()));
 }
 
-export async function reconcileAll(parentSessionId?: string): Promise<ReconcileResult[]> {
+export async function reconcileAll(parentSessionId?: string, parentSessionFile?: string): Promise<ReconcileResult[]> {
 	const results: ReconcileResult[] = [];
-	for (const run of Run.list(parentSessionId)) {
+	for (const run of Run.list(parentSessionId, parentSessionFile)) {
 		results.push(await run.reconcile());
 	}
 	return results;

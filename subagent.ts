@@ -13,9 +13,11 @@ import {
 	inboxDir,
 	listTrash,
 	listUnreadableRuns,
+	markDelivered,
 	mergeConfigs,
 	purgeTrash,
 	readLatestAssistant,
+	readRunEvents,
 	removeRunDir,
 	reconcileAll,
 	Run,
@@ -47,7 +49,7 @@ function usage(): never {
   subagent spawn [--name <name>] [--preset <name>] [--provider <provider>] [--model <model>]
     [--thinking <level>] [--cwd <dir>] [--tools <names>] [--no-extensions]
     [--extension <path|builtin:name>]... [--no-skills] [--no-prompt-templates] [--no-context-files]
-    (--prompt <text> | --file <path>)...
+    [--wait] (--prompt <text> | --file <path>)...
   subagent status <handle>
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
@@ -175,7 +177,7 @@ function resolveChoice(
 	return resolved;
 }
 
-function spawnSubagent(args: string[]): void {
+async function spawnSubagent(args: string[]): Promise<void> {
 	if (process.env.PI_SUBAGENT_RUN_DIR) fail("Nested subagents are disabled");
 	let name: string | undefined;
 	let presetName: string | undefined;
@@ -186,6 +188,7 @@ function spawnSubagent(args: string[]): void {
 	let noSkills = false;
 	let noPromptTemplates = false;
 	let noContextFiles = false;
+	let wait = false;
 	const prompts: string[] = [];
 	const files: string[] = [];
 	const extensions: string[] = [];
@@ -236,6 +239,9 @@ function spawnSubagent(args: string[]): void {
 				break;
 			case "--no-context-files":
 				noContextFiles = true;
+				break;
+			case "--wait":
+				wait = true;
 				break;
 			case "--prompt":
 				prompts.push(valueAfter(args, i, arg));
@@ -315,6 +321,10 @@ function spawnSubagent(args: string[]): void {
 	}
 
 	process.stdout.write(`Spawned ${run.displayName}\nState: starting\nAttach: tmux attach -t ${tmuxSession}\n`);
+	if (!wait) return;
+	// Same text `wait` prints, so a caller can treat both paths as one result.
+	process.stdout.write("\n");
+	await waitSubagent([handle]);
 }
 
 async function statusSubagent(args: string[]): Promise<void> {
@@ -445,6 +455,10 @@ async function waitSubagent(args: string[]): Promise<void> {
 		const message = readLatestAssistant(run.sessionFile);
 		if (!message) fail(`${handle} finished without an assistant response`);
 		process.stdout.write(`${handle} finished\n\n${assistantText(message)}\n`);
+		// The caller just read the result, so the parent extension must not report it a second time.
+		if (process.env.PI_SESSION_FILE === run.parentSessionFile) {
+			markDelivered(run.dir, readRunEvents(run.dir).at(-1)?.seq ?? 0);
+		}
 		if (message.stopReason === "error" || message.stopReason === "aborted") process.exitCode = 1;
 		return;
 	}
@@ -510,7 +524,8 @@ async function gcSubagents(args: string[]): Promise<void> {
 
 async function listSubagents(args: string[]): Promise<void> {
 	if (args.length !== 0) usage();
-	const runs = await reconcileAll(process.env.PI_SESSION_ID || undefined);
+	// A resumed session has a new id for the same file; either one identifies this session's runs.
+	const runs = await reconcileAll(process.env.PI_SESSION_ID || undefined, process.env.PI_SESSION_FILE || undefined);
 	if (runs.length === 0) {
 		process.stdout.write("No subagents\n");
 		return;
@@ -527,7 +542,7 @@ async function main(): Promise<void> {
 	const command = args.shift();
 	switch (command) {
 		case "spawn":
-			spawnSubagent(args);
+			await spawnSubagent(args);
 			break;
 		case "status":
 			await statusSubagent(args);

@@ -76,6 +76,10 @@ Three additional built-in tools are available but off by default:
 
 Spawn prints a random handle and the exact tmux attach command. Keep the handle for later commands. A child lives for one turn: when its turn settles and nothing is queued, the process exits on its own. The record and transcript stay, so `send` starts a fresh process with the same history. A running child survives `/reload`. When the spawning Pi session quits, any turn still running is stopped and the record is kept. `subagent stop` moves the record to the trash and `subagent gc --purge` deletes it.
 
+Do not wait for a spawned child by default. Keep working on something else: when the child finishes, its result arrives as a message in this session, and you can answer the user while it runs. Spawn several children for parallel work and collect their results as they arrive.
+
+Add `--wait` when the next step genuinely depends on the result and nothing else can proceed; it prints the same text `wait` does.
+
 ## Inspect and wait
 
 ```sh
@@ -86,7 +90,7 @@ subagent wait <handle>
 
 Run `subagent list` at any time to rediscover active subagents and their handles, names, and current states if you no longer remember them.
 
-`wait` waits for the turn to settle and its process to leave, then prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
+`wait` blocks until the turn settles and its process leaves, then prints the latest final assistant response. Prefer not to call it after `spawn`: a finished child reports its own result. Use it to re-read a result you have lost, or from a script that needs the text on stdout. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
 
 ## Communicate
 

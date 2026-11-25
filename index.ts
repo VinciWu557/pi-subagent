@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, watch, type FSWatcher } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -21,8 +21,18 @@ import {
 	type TUI,
 } from "@earendil-works/pi-tui";
 import {
+	appendRunEvent,
+	assistantText,
+	getRunsDir,
 	inspectRuns,
+	isEventsFile,
+	isProcessAlive,
+	markCrashNotified,
+	markDelivered,
+	readDeliveredSeq,
+	readRunEvents,
 	Run,
+	wasCrashNotified,
 	type InboxMessage,
 	type RunSnapshot,
 	type RunState,
@@ -46,6 +56,71 @@ const STATE_COLORS = {
 const CLIENT_POLL_ATTEMPTS = 60;
 const CLIENT_POLL_INTERVAL_MS = 500;
 
+/**
+ * A finished child writes one line; the watcher turns it into a turn within a few milliseconds.
+ * The timer also covers what no file event announces — a child whose process is simply gone — so it
+ * runs at crash-report speed, not at "safety net" speed.
+ */
+const DELIVERY_INTERVAL_MS = 1000;
+const COMPLETION_TYPE = "subagent.completion";
+
+interface Pending {
+	run: Run;
+	kind: "settled" | "aborted" | "crashed";
+	/** For a crash, the state that says how it ended (crashed, exited, interrupted, error). */
+	label?: RunState;
+	text: string;
+	/** Event seq; absent for a crash, which is deduplicated by its marker file instead. */
+	seq?: number;
+}
+
+/** `details` on the custom message, so a renderer or a later reader can tell the lines apart. */
+type CompletionDetails =
+	| { kind: Pending["kind"]; handle: string; seq?: number }
+	| { kind: "digest"; items: { handle: string; kind: string; seq?: number }[] };
+
+/** How an ending reads: a normal end, a crash, or a run that went away with the session. */
+function endingLabel(item: Pending): string {
+	if (item.kind === "settled") return "finished";
+	if (item.kind === "aborted" || item.label === "interrupted") return "was interrupted";
+	if (item.label === "exited") return "exited";
+	// starting, busy, crashed and error all mean the same thing to a reader: no result came back.
+	return "crashed";
+}
+
+function completionHeadline(item: Pending): string {
+	return `[subagent ${item.run.displayName}] ${endingLabel(item)}`;
+}
+
+function completionContent(item: Pending): string {
+	return `${completionHeadline(item)}\n\n${item.text}`;
+}
+
+/** One wakeup for everything that ended while the session was closed. */
+function digestContent(pending: Pending[]): string {
+	const lines = pending.map((item) => {
+		const summary = item.text.split("\n").find((line) => line.trim()) ?? "";
+		return `- ${item.run.displayName}: ${endingLabel(item)} — ${summary.slice(0, 160)}`;
+	});
+	return `[subagent] ${pending.length} subagents ended while this session was closed\n\n${lines.join("\n")}`;
+}
+
+function crashReason(state: RunState, error: string | undefined): string {
+	if (error) return error;
+	if (state === "interrupted") return "Interrupted when this session closed.";
+	if (state === "exited") return "Exited without a result.";
+	return "The process is gone.";
+}
+
+/** The text of the last assistant turn, taken from the live session rather than the transcript file. */
+function turnText(ctx: ExtensionContext): string {
+	for (const entry of ctx.sessionManager.getEntries().toReversed()) {
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		return assistantText(entry.message);
+	}
+	return "(no response text)";
+}
+
 function isInboxMessage(value: unknown): value is InboxMessage {
 	if (typeof value !== "object" || value === null) return false;
 	const message = value as Record<string, unknown>;
@@ -64,8 +139,8 @@ function isActive(snapshot: RunSnapshot): boolean {
 	return snapshot.alive || snapshot.state === "starting";
 }
 
-async function activeRuns(sessionId: string): Promise<RunSnapshot[]> {
-	return (await inspectRuns(sessionId)).filter(isActive);
+async function activeRuns(sessionId: string, sessionFile?: string): Promise<RunSnapshot[]> {
+	return (await inspectRuns(sessionId, sessionFile)).filter(isActive);
 }
 
 interface EditorHooks {
@@ -229,19 +304,35 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handler: async (_args, ctx) => openPicker(ctx),
 	});
 
+	pi.registerMessageRenderer(COMPLETION_TYPE, (message, _options, theme) => {
+		const [headline, ...rest] = message.content.split("\n");
+		const kind = (message.details as { kind?: string } | undefined)?.kind;
+		const color = kind === "settled" || kind === "digest" ? "success" : "warning";
+		return new Text(theme.fg(color, headline) + theme.fg("text", `\n${rest.join("\n")}`), 0, 0);
+	});
+
 	if (!runDir) {
 		let widgetTimer: ReturnType<typeof setInterval> | undefined;
+		let deliveryTimer: ReturnType<typeof setInterval> | undefined;
+		let deliveryWatcher: FSWatcher | undefined;
 		let widgetContext: ExtensionContext | undefined;
 		let editorInstalled = false;
 		let activeCount = 0;
 		let refreshing = false;
+		let delivering = false;
+		let deliverAgain = false;
+		/** Highest completion already put into this session's context, per run handle. */
+		const delivered = new Map<string, number>();
+		/** Handed to the runtime but not yet seen in the transcript; resending would duplicate it. */
+		const sent = new Map<string, string>();
+		const markKey = (handle: string, seq: number): string => `${handle}:${seq}`;
 
 		const refreshWidget = async (): Promise<void> => {
 			const ctx = widgetContext;
 			if (!ctx || refreshing) return;
 			refreshing = true;
 			try {
-				const active = await activeRuns(ctx.sessionManager.getSessionId());
+				const active = await activeRuns(ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile());
 				activeCount = active.length;
 				if (active.length === 0) {
 					ctx.ui.setWidget("subagents", undefined);
@@ -272,9 +363,165 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			}
 		};
 
+		/**
+		 * Completions and crashes are both read from disk, never from memory, so a reload or a crash
+		 * between the child finishing and the parent waking up costs nothing: the next tick reads the
+		 * same lines and the same marker files.
+		 */
+		/** A run that produced a result is never also reported as having died. */
+		const crashPending = async (run: Run, boot: boolean): Promise<Pending | undefined> => {
+			if (wasCrashNotified(run.dir)) return undefined;
+			const pid = run.pid;
+			// The cheap check first: a live pid needs no socket probe at all.
+			if (pid !== undefined && isProcessAlive(pid)) return undefined;
+			const snapshot = await run.inspect();
+			if (snapshot.alive) return undefined;
+			// Nothing has reported yet, so only the boot grace can tell a boot from a corpse.
+			if (pid === undefined && snapshot.state === "starting") return undefined;
+			// This parent interrupts its children on shutdown; saying so mid-session is noise.
+			if (snapshot.state === "interrupted" && !boot) return undefined;
+			return { run, kind: "crashed", label: snapshot.state, text: crashReason(snapshot.state, run.error) };
+		};
+
+		const pendingOf = async (run: Run, boot: boolean): Promise<Pending[]> => {
+			const last = delivered.get(run.handle) ?? readDeliveredSeq(run.dir);
+			delivered.set(run.handle, last);
+			const events = readRunEvents(run.dir);
+			if (events.length > 0) {
+				return events
+					.filter((event) => event.seq > last && !sent.has(markKey(run.handle, event.seq)))
+					.map((event) => ({ run, kind: event.kind, text: event.text, seq: event.seq }));
+			}
+			const crash = await crashPending(run, boot);
+			return crash ? [crash] : [];
+		};
+
+		const collectPending = async (boot: boolean): Promise<Pending[]> => {
+			const ctx = widgetContext;
+			if (!ctx) return [];
+			const runs = Run.list(ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile());
+			const pending: Pending[] = [];
+			for (const run of runs) pending.push(...(await pendingOf(run, boot)));
+			return pending;
+		};
+
+		const sendCompletion = (content: string, details: CompletionDetails): void => {
+			const message = { customType: COMPLETION_TYPE, content, display: true, details };
+			// triggerTurn is explicit on purpose: it defaults to false, which appends without waking anyone.
+			pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+		};
+
+		/**
+		 * A returned sendMessage only means the runtime took the message, not that it reached the
+		 * session: a steer waits in the run's queue and dies with the process. The cursor moves when
+		 * the transcript shows the message, so a crash in between re-delivers instead of losing it.
+		 */
+		const handOver = (item: Pending): void => {
+			if (item.seq === undefined) return;
+			sent.set(markKey(item.run.handle, item.seq), item.run.dir);
+		};
+
+		const confirm = (marks: { handle: string; seq?: number }[]): void => {
+			for (const mark of marks) {
+				if (mark.seq === undefined) continue;
+				const key = markKey(mark.handle, mark.seq);
+				const dir = sent.get(key);
+				sent.delete(key);
+				if (!dir || mark.seq <= (delivered.get(mark.handle) ?? 0)) continue;
+				delivered.set(mark.handle, mark.seq);
+				markDelivered(dir, mark.seq);
+			}
+		};
+
+		const deliverEach = (pending: Pending[]): void => {
+			for (const item of pending) {
+				if (item.seq === undefined && !markCrashNotified(item.run.dir, item.kind)) continue;
+				sendCompletion(completionContent(item), { kind: item.kind, handle: item.run.handle, seq: item.seq });
+				handOver(item);
+			}
+		};
+
+		const deliverDigest = (pending: Pending[]): void => {
+			for (const item of pending) {
+				if (item.seq === undefined) markCrashNotified(item.run.dir, item.kind);
+			}
+			sendCompletion(digestContent(pending), {
+				kind: "digest",
+				items: pending.map(({ run, kind, seq }) => ({ handle: run.handle, kind, seq })),
+			});
+			for (const item of pending) handOver(item);
+		};
+
+		const deliverCompletions = async (boot = false): Promise<void> => {
+			if (!widgetContext) return;
+			if (delivering) {
+				// A second line landed while the first delivery was in flight; do not drop it.
+				deliverAgain = true;
+				return;
+			}
+			delivering = true;
+			try {
+				const pending = await collectPending(boot);
+				if (pending.length === 0) return;
+				// One wakeup for everything that ended while the session was closed.
+				if (boot && pending.length > 1) deliverDigest(pending);
+				else deliverEach(pending);
+			} catch {
+				// A bad run directory must not stop the timer or spam stderr; the next tick retries.
+			} finally {
+				delivering = false;
+				if (deliverAgain) {
+					deliverAgain = false;
+					setTimeout(() => void deliverCompletions(), 0).unref();
+				}
+			}
+		};
+
+		/** The watcher is the fast path; the tick is what notices a death and any edge the watcher missed. */
+		const startDelivery = (): void => {
+			if (deliveryTimer) return;
+			try {
+				// The root may not exist yet on a fresh agent dir; watching a missing path throws.
+				mkdirSync(getRunsDir(), { recursive: true, mode: 0o700 });
+				deliveryWatcher = watch(getRunsDir(), { recursive: true }, (_event, file) => {
+					if (typeof file === "string" && isEventsFile(file)) void deliverCompletions();
+				});
+				deliveryWatcher.on("error", () => {
+					deliveryWatcher?.close();
+					deliveryWatcher = undefined;
+				});
+				deliveryWatcher.unref();
+			} catch {
+				// No watcher (unsupported filesystem): the timer still catches everything.
+			}
+			// The first tick is a digest: whatever ended while this session was closed, in one turn.
+			void deliverCompletions(true);
+			deliveryTimer = setInterval(() => void deliverCompletions(), DELIVERY_INTERVAL_MS);
+			deliveryTimer.unref();
+		};
+
+		const stopDelivery = (): void => {
+			if (deliveryTimer) clearInterval(deliveryTimer);
+			deliveryTimer = undefined;
+			deliveryWatcher?.close();
+			deliveryWatcher = undefined;
+		};
+
+		/** A completion in the transcript is the only proof that it reached the context. */
+		pi.on("message_start", (event) => {
+			const message = event.message;
+			if (message.role !== "custom" || message.customType !== COMPLETION_TYPE) return;
+			const details = message.details as CompletionDetails | undefined;
+			confirm(details?.items ?? [{ handle: details?.handle ?? "", seq: details?.seq }]);
+		});
+
 		pi.on("session_start", async (_event, ctx) => {
-			if (!ctx.hasUI) return;
 			widgetContext = ctx;
+			delivered.clear();
+			sent.clear();
+			// Delivery is headless: an RPC driver wants the same wakeup the TUI gets.
+			startDelivery();
+			if (!ctx.hasUI) return;
 			// Another extension may own the editor slot; never replace it.
 			if (!editorInstalled && ctx.ui.getEditorComponent() === undefined) {
 				// Hooks read the live widgetContext, so a later session swap does not leave them on a stale ctx.
@@ -298,15 +545,29 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		pi.on("agent_settled", async (event, ctx) => {
 			// Escape aborts the parent run; every child that is still working stops its own turn likewise.
 			if (!event.aborted) return;
-				for (const { run, state } of await inspectRuns(ctx.sessionManager.getSessionId())) {
-					if (state !== "busy" && state !== "starting") continue;
-					run.queue({ kind: "interrupt" });
-				}
+			const runs = await inspectRuns(ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile());
+			for (const { run, state } of runs) {
+				if (state !== "busy" && state !== "starting") continue;
+				run.queue({ kind: "interrupt" });
+			}
 		});
+
+		/** Records outlive the parent; only a turn still running has to stop with it. */
+		const stopChildren = async (ctx: ExtensionContext): Promise<void> => {
+			const runs = await inspectRuns(ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile());
+			for (const view of runs) {
+				if (!view.alive) continue;
+				spawnSync("tmux", ["kill-session", "-t", view.run.tmuxSession], { stdio: "ignore" });
+				await view.run.waitForShutdown();
+				// A turn we cut short is not the same as one that settled.
+				if (view.run.state === "busy" || view.run.state === "starting") view.run.updateStatus({ state: "interrupted" });
+			}
+		};
 
 		pi.on("session_shutdown", async (event, ctx) => {
 			if (widgetTimer) clearInterval(widgetTimer);
 			widgetTimer = undefined;
+			stopDelivery();
 			widgetContext = undefined;
 			ctx.ui.setWidget("subagents", undefined);
 			// Restore before a reload, so the freshly loaded extension sees a free editor slot.
@@ -315,16 +576,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				editorInstalled = false;
 			}
 			if (event.reason === "reload") return;
-			// Records outlive the parent; only a turn still running has to stop with it.
-			for (const view of await inspectRuns(ctx.sessionManager.getSessionId())) {
-				if (!view.alive) continue;
-				spawnSync("tmux", ["kill-session", "-t", view.run.tmuxSession], { stdio: "ignore" });
-				await view.run.waitForShutdown();
-				// A turn we cut short is not the same as one that settled.
-				if (view.run.state === "busy" || view.run.state === "starting") {
-					view.run.updateStatus({ state: "interrupted" });
-				}
-			}
+			await stopChildren(ctx);
 		});
 		return;
 	}
@@ -429,6 +681,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			childSessionId: ctx.sessionManager.getSessionId(),
 			state: ctx.isIdle() ? "idle" : "busy",
 			error: undefined,
+			// The parent needs a pid to tell "still booting" from "died before it could report".
+			pid: process.pid,
 		});
 		syncSessionName();
 		if (!timer) {
@@ -443,13 +697,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		Run.load(runDir)?.updateStatus({ state: "busy", hasStarted: true, error: undefined });
 	});
 
-	pi.on("agent_settled", (_event, ctx) => {
+	pi.on("agent_settled", (event, ctx) => {
 		currentContext = ctx;
 		if (!ctx.isIdle()) return;
 		const run = Run.load(runDir);
-		run?.updateStatus({ state: "idle" });
+		if (!run) return;
+		run.updateStatus({ state: "idle" });
+		// Written before the exit path: this line is the whole reason the parent can act without waiting.
+		appendRunEvent(run.dir, event.aborted ? "aborted" : "settled", turnText(ctx));
 		// A turn-scoped process: with nothing queued, this is where the run ends.
-		if (run?.hasInbox()) return;
+		if (run.hasInbox()) return;
 		if (timer) {
 			clearInterval(timer);
 			timer = undefined;

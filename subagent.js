@@ -12,6 +12,7 @@ import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   accessSync,
+  appendFileSync,
   constants,
   existsSync,
   mkdirSync,
@@ -116,6 +117,8 @@ function loadConfig(cwd) {
 }
 var RUN_FILE = "run.json";
 var STATUS_FILE = "status.json";
+var EVENTS_FILE = "events.jsonl";
+var DELIVERED_FILE = "delivered.json";
 var VIEW_FILE = "view.json";
 var LOCK_FILE = "alive.sock";
 var LOCK_PROBE_TIMEOUT_MS = 250;
@@ -154,6 +157,45 @@ function queueInboxMessage(runDir, payload) {
   renameSync(temporary, target);
   return target;
 }
+function eventsPath(runDir) {
+  return join(runDir, EVENTS_FILE);
+}
+function isRunEvent(value) {
+  if (typeof value !== "object" || value === null)
+    return false;
+  const event = value;
+  return event.version === 1 && typeof event.seq === "number" && (event.kind === "settled" || event.kind === "aborted") && typeof event.at === "string" && typeof event.text === "string";
+}
+function readRunEvents(runDir) {
+  let content;
+  try {
+    content = readFileSync(eventsPath(runDir), "utf8");
+  } catch {
+    return [];
+  }
+  const events = [];
+  for (const line of content.split(`
+`)) {
+    if (!line.trim())
+      continue;
+    try {
+      const value = JSON.parse(line);
+      if (isRunEvent(value))
+        events.push(value);
+    } catch {}
+  }
+  return events;
+}
+function panePid(tmuxSession) {
+  const result = spawnSync("tmux", ["list-panes", "-t", tmuxSession, "-F", "#{pane_pid}"], { encoding: "utf8" });
+  if (result.status !== 0)
+    return;
+  const pid = Number.parseInt(result.stdout.trim(), 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+function markDelivered(runDir, seq) {
+  writeJson(join(runDir, DELIVERED_FILE), { version: 1, seq, at: new Date().toISOString() });
+}
 function isValidRunName(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 64 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
 }
@@ -180,7 +222,8 @@ function parseStatus(value) {
     hasStarted: status.hasStarted === true,
     childSessionId: typeof status.childSessionId === "string" ? status.childSessionId : undefined,
     updatedAt: typeof status.updatedAt === "string" ? status.updatedAt : new Date(0).toISOString(),
-    error: typeof status.error === "string" ? status.error : undefined
+    error: typeof status.error === "string" ? status.error : undefined,
+    pid: typeof status.pid === "number" ? status.pid : undefined
   };
 }
 function initialStatus(descriptor) {
@@ -218,18 +261,17 @@ class Run {
   static find(handle) {
     return Run.load(join(getRunsDir(), handle));
   }
-  static list(parentSessionId) {
+  static list(parentSessionId, parentSessionFile) {
     const root = getRunsDir();
     if (!existsSync(root))
       return [];
     const runs = [];
+    const mine = (run) => !parentSessionId || run.parentSessionId === parentSessionId || parentSessionFile !== undefined && run.parentSessionFile === parentSessionFile;
     for (const entry of readdirSync(root, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.startsWith("."))
         continue;
       const run = Run.load(join(root, entry.name));
-      if (!run)
-        continue;
-      if (parentSessionId && run.parentSessionId !== parentSessionId)
+      if (!run || !mine(run))
         continue;
       runs.push(run);
     }
@@ -268,6 +310,9 @@ class Run {
   get parentSessionId() {
     return this.descriptor.parentSessionId;
   }
+  get parentSessionFile() {
+    return this.descriptor.parentSessionFile;
+  }
   get createdAt() {
     return this.descriptor.createdAt;
   }
@@ -303,6 +348,12 @@ class Run {
   }
   launch(initialArgs = []) {
     launchProcess(this.descriptor, initialArgs);
+    const pid = panePid(this.descriptor.tmuxSession);
+    if (pid !== undefined)
+      this.updateDescriptor({ pid });
+  }
+  get pid() {
+    return this.status.pid ?? this.descriptor.pid;
   }
   queue(payload) {
     return queueInboxMessage(this.dir, payload);
@@ -384,9 +435,9 @@ class Run {
     return !this.hasStarted && !this.hasTranscript() && !this.hasInbox();
   }
 }
-async function reconcileAll(parentSessionId) {
+async function reconcileAll(parentSessionId, parentSessionFile) {
   const results = [];
-  for (const run of Run.list(parentSessionId)) {
+  for (const run of Run.list(parentSessionId, parentSessionFile)) {
     results.push(await run.reconcile());
   }
   return results;
@@ -623,7 +674,7 @@ function usage() {
   subagent spawn [--name <name>] [--preset <name>] [--provider <provider>] [--model <model>]
     [--thinking <level>] [--cwd <dir>] [--tools <names>] [--no-extensions]
     [--extension <path|builtin:name>]... [--no-skills] [--no-prompt-templates] [--no-context-files]
-    (--prompt <text> | --file <path>)...
+    [--wait] (--prompt <text> | --file <path>)...
   subagent status <handle>
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
@@ -723,7 +774,7 @@ function resolveChoice(flags, preset, config, sources) {
   }
   return resolved;
 }
-function spawnSubagent(args) {
+async function spawnSubagent(args) {
   if (process.env.PI_SUBAGENT_RUN_DIR)
     fail("Nested subagents are disabled");
   let name;
@@ -735,6 +786,7 @@ function spawnSubagent(args) {
   let noSkills = false;
   let noPromptTemplates = false;
   let noContextFiles = false;
+  let wait = false;
   const prompts = [];
   const files = [];
   const extensions = [];
@@ -784,6 +836,9 @@ function spawnSubagent(args) {
         break;
       case "--no-context-files":
         noContextFiles = true;
+        break;
+      case "--wait":
+        wait = true;
         break;
       case "--prompt":
         prompts.push(valueAfter(args, i, arg));
@@ -874,6 +929,11 @@ ${prompts.join(`
 State: starting
 Attach: tmux attach -t ${tmuxSession}
 `);
+  if (!wait)
+    return;
+  process.stdout.write(`
+`);
+  await waitSubagent([handle]);
 }
 async function statusSubagent(args) {
   if (args.length !== 1)
@@ -1010,6 +1070,9 @@ async function waitSubagent(args) {
 
 ${assistantText(message)}
 `);
+    if (process.env.PI_SESSION_FILE === run.parentSessionFile) {
+      markDelivered(run.dir, readRunEvents(run.dir).at(-1)?.seq ?? 0);
+    }
     if (message.stopReason === "error" || message.stopReason === "aborted")
       process.exitCode = 1;
     return;
@@ -1081,7 +1144,7 @@ async function gcSubagents(args) {
 async function listSubagents(args) {
   if (args.length !== 0)
     usage();
-  const runs = await reconcileAll(process.env.PI_SESSION_ID || undefined);
+  const runs = await reconcileAll(process.env.PI_SESSION_ID || undefined, process.env.PI_SESSION_FILE || undefined);
   if (runs.length === 0) {
     process.stdout.write(`No subagents
 `);
@@ -1097,7 +1160,7 @@ async function main() {
   const command = args.shift();
   switch (command) {
     case "spawn":
-      spawnSubagent(args);
+      await spawnSubagent(args);
       break;
     case "status":
       await statusSubagent(args);
